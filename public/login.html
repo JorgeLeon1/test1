@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login</title>
+    <style>
+        /* Reset some default styles */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* General body styles */
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            color: #333;
+            display: flex;
+            height: 100vh;
+            margin: 0;
+        }
+
+        /* Container for the side panel and image */
+        .container {
+            display: flex;
+            width: 100%;
+        }
+
+        /* Sidebar for login form */
+        .login-container {
+            background-color: #fff;
+            width: 600px;  /* Fixed width for the login panel */
+            padding: 40px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Logo */
+        .logo {
+            width: 300px;  /* Adjust size as needed */
+            margin-bottom: 20px;  /* Space below logo */
+        }
+
+        /* Login Form */
+        h2 {
+            margin-bottom: 20px;
+            color: #333;
+        }
+
+        .input-container {
+            margin-bottom: 20px;
+            width: 100%;
+            position: relative;
+        }
+
+        .input-container label {
+            display: block;
+            font-size: 16px;
+            margin-bottom: 8px;
+            color: #555;
+        }
+
+        .input-container input {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            box-sizing: border-box;
+            transition: border-color 0.3s ease;
+        }
+
+        .input-container input:focus {
+            border-color: #0066ff;
+            outline: none;
+        }
+
+        .login-button {
+            width: 100%;
+            padding: 12px;
+            background-color: #007BFF;
+            color: white;
+            font-size: 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .login-button:hover {
+            background-color: #0056b3;
+        }
+
+        .error {
+            color: red;
+            font-weight: bold;
+            display: none; /* Hide by default */
+        }
+
+        /* Image side panel */
+        .image-container {
+            flex-grow: 1;
+            background-image: url('./images/WarehouseFloor.jpg');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-attachment: fixed;
+            height: 100vh;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .login-container {
+                padding: 20px;
+                width: 100%;
+                max-width: 350px;
+            }
+
+            .image-container {
+                display: none; /* Hide image on smaller screens */
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Login Panel -->
+        <div class="login-container">
+            <!-- Logo -->
+            <img src="./images/wmLogo.png" alt="Logo" class="logo"> <!-- Adjust the path to your logo image -->
+
+
+            <form action="/login" method="POST" id="loginForm">
+                <div class="input-container">
+                    <label for="username" style="font-weight: bold">Username</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="input-container">
+                    <label for="password" style="font-weight: bold">Password</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit" class="login-button" style="font-weight: bold;">Login</button>
+                <p id="errorMessage" class="error">Invalid credentials. Please try again.</p>
+
+            </form>
+        </div>
+
+        <!-- Image Panel -->
+        <div class="image-container"></div>
+    </div>
+
+</body>
+<script>
+    document.getElementById('loginForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        
+        const username = document.getElementById('username').value;
+        const password = document.getElementById('password').value;
+
+        const response = await fetch('/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+
+        console.log('res', response)
+        if (response.redirected) {
+            window.location.href = response.url; // Redirect on success
+        } else {
+            document.getElementById('errorMessage').style.display = 'block'; // Show error message
+        }
+    });
+</script>
+</html>

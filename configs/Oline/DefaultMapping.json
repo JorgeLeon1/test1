@@ -1,0 +1,36 @@
+{
+    "customerIdentifier": {
+        "id": 25
+    },
+    "facilityIdentifier": {
+        "id": "2"
+    },
+    "referenceNum": "random",
+    "notes": "",
+    "shippingNotes": "",
+    "billingCode": "Prepaid",
+    "routingInfo": {
+        "carrier": "UPS",
+        "mode": "03",
+        "scacCode": "",
+        "account": ""
+    },
+    "shipTo": {
+        "companyName": "various",
+        "name": "various",
+        "address1": "various",
+        "address2": "various",
+        "city": "various",
+        "state": "various",
+        "zip": "various",
+        "country": "various"
+    },
+    "orderItems": [
+        {
+            "itemIdentifier": {
+                "sku": "GRA-2164610"
+            },
+            "qty": 2
+        }
+    ]
+}

@@ -1,0 +1,25 @@
+{
+        "orderId": "your field name",
+        "customer_id": "your field name",
+        "facility_id": "your field name",
+        "reference_num": "your field name",
+        "notes": "your field name",
+        "shipping_notes": "your field name",
+        "billing_code": "your field name",
+        "carrier": "your field name",
+        "mode": "your field name",
+        "scac_code": "your field name",
+        "account": "your field name",
+        "shipto_company_name": "your field name",
+        "shipto_name": "your field name",
+        "shipto_address1": "your field name",
+        "shipto_address2": "your field name",
+        "shipto_city": "your field name",
+        "shipto_state": "your field name",
+        "shipto_zip": "your field name",
+        "shipto_country": "your field name",
+        "lineId": "your field name",
+        "sku": "your field name",
+        "qty": "your field name"
+
+}

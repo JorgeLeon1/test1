@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Order Lines</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f9fafb;
+      margin: 2rem;
+    }
+    h2  {
+        margin-bottom: 1rem;
+        font-size: 1.8rem;
+        color: #00796b;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 2rem;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    thead {
+      background-color: #e5e7eb;
+    }
+    th, td {
+      padding: 0.45rem 1rem;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+      font-size: 11pt;
+    }
+    tr.group-header {
+      background-color: #f3f4f6;
+      font-weight: bold;
+    }
+    tr:hover td {
+      background-color: #f0fdf4;
+    }
+    input[type="checkbox"] {
+      transform: scale(1.2);
+    }
+    .loading {
+      font-style: italic;
+      color: #6b7280;
+    }
+    #allocate-btn {
+    background-color: #10b981; /* Emerald green */
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+  }
+  #toggle-orders-btn {
+    background-color: #3b82f6; /* Blue */
+    color: white;
+    padding: 0.75rem 1.5rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+  }
+  #allocate-btn:hover {
+    background-color: #059669;
+  }
+  .spinner {
+    border: 8px solid #5c6bc0; 
+    border-top: 8px solid #3498db;
+    border-radius: 50%;
+    width: 60px;
+    height: 60px;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  </style>
+</head>
+<body>
+
+  <h2>Select Order Lines To Allocate</h2>
+  <div id="orders-container">
+    <p class="loading">Loading orders...</p>
+  </div>
+  <button id="toggle-orders-btn" onclick="toggleOrdersContainer()" style="display:none; margin-bottom: 1rem;">
+    Show Orders
+  </button>
+  <button id="allocate-btn" onclick="allocateOrderLines()">Allocate Order Lines</button>
+  <button id="allocate-btn" onclick="alert('coming soon! Choose batch by PO, batch my destination, etc. and orders will select themselves')">Define a batch</button>
+  <button id="allocate-btn" onclick="alert('coming soon! Partial pallets that can be consolidated will be selected, and team members will be notified to consolidate before allocation and picking!')">Consolidate</button>
+
+
+
+  <div id="visualization-container" style="margin-top: 2rem;"></div>
+  <div id="loadingSpinner" style="
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 1000;
+    display: none;
+  ">
+  <div class="spinner"></div>
+  </div>
+
+  
+  <script>
+  
+    function groupByOrder(data) {
+      return data.reduce((acc, line) => {
+        const key = `${line.order_id} | ${line.customerName}`;
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(line);
+        return acc;
+      }, {});
+    }
+  
+    function renderTable(groupedData) {
+  const container = document.getElementById('orders-container');
+  container.innerHTML = '';
+
+  for (const groupKey in groupedData) {
+    const [orderNumber, customer] = groupKey.split(' | ');
+    const lines = groupedData[groupKey];
+    const groupId = `group-${orderNumber}`;
+
+    const tableWrapper = document.createElement('div');
+    tableWrapper.classList.add('table-wrapper');
+    tableWrapper.dataset.group = groupId;
+
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    thead.innerHTML = `
+      <tr class="group-header">
+        <td colspan="5">
+          <label>
+            <input type="checkbox" class="toggle-group" data-group="${groupId}" checked />
+            <strong>Order #${orderNumber} – ${customer}</strong>
+          </label>
+          &nbsp;&nbsp;&nbsp;
+          <label style="font-weight: normal; font-size: 0.9em;">
+            <input type="checkbox" class="select-all-group" data-group="${groupId}" />
+            Select All
+          </label>
+        </td>
+      </tr>
+      <tr>
+        <th style="padding: 4px;"></th>
+        <th style="padding: 4px;">SKU</th>
+        <th style="padding: 4px;">Quantity</th>
+      </tr>
+    `;
+
+    const tbody = document.createElement('tbody');
+    tbody.classList.add('group-lines');
+    tbody.dataset.group = groupId;
+
+    for (const line of lines) {
+      const row = document.createElement('tr');
+      row.innerHTML = `
+        <td style="padding: 4px;"><input type="checkbox" class="select-line" data-id="${line.order_id}" data-group="${groupId}" /></td>
+        <td style="padding: 4px;">${line.sku}</td>
+        <td style="padding: 4px;">${line.qty}</td>
+      `;
+      tbody.appendChild(row);
+    }
+
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    tableWrapper.appendChild(table);
+    container.appendChild(tableWrapper);
+  }
+
+  // Collapse/expand group lines
+  document.querySelectorAll('.toggle-group').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const group = e.target.dataset.group;
+      const rows = document.querySelectorAll(`tbody[data-group="${group}"]`);
+      rows.forEach(row => {
+        row.style.display = e.target.checked ? '' : 'none';
+      });
+    });
+  });
+
+  // Select all in group
+  document.querySelectorAll('.select-all-group').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const group = e.target.dataset.group;
+      const checkboxes = document.querySelectorAll(`.select-line[data-group="${group}"]`);
+      checkboxes.forEach(c => c.checked = e.target.checked);
+    });
+  });
+}
+
+// Helper to collapse all groups
+function collapseAllGroups() {
+  document.querySelectorAll('.toggle-group').forEach(cb => {
+    cb.checked = false;
+    const group = cb.dataset.group;
+    const rows = document.querySelectorAll(`tbody[data-group="${group}"]`);
+    rows.forEach(row => {
+      row.style.display = 'none';
+    });
+  });
+}
+
+
+  
+async function allocateOrderLines() {
+  const selected = Array.from(document.querySelectorAll('.select-line:checked'));
+  console.log(selected)
+  const selectedIds = selected.map(cb => cb.dataset.id);
+  console.log(selectedIds)
+  if (selectedIds.length === 0) {
+    alert('Please select at least one order line to allocate.');
+    return;
+  }
+  console.log('Allocating order lines:', selectedIds);
+
+  // Collapse the entire orders container
+  const ordersContainer = document.getElementById('orders-container');
+  if (ordersContainer) {
+    ordersContainer.style.display = 'none';
+  }
+
+  // Show toggle button
+  const toggleBtn = document.getElementById('toggle-orders-btn');
+  if (toggleBtn) {
+    toggleBtn.style.display = 'inline-block';
+  }
+
+  try {
+    const spinner = document.getElementById('loadingSpinner');
+    spinner.style.display = 'block';
+    const res = await fetch('/allocateOrders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lineIds: selectedIds })
+    });
+
+     // Hide spinner
+     spinner.style.display = 'none';
+
+
+    if (!res.ok) throw new Error("Server error");
+    // Get the JSON response
+    const data = await res.json();
+    console.log(data); //
+    alert('just a glimpse until dispalyed properly - these are the allocations:\n' + JSON.stringify(data))
+    loadVisualization();
+  } catch (err) {
+    console.error(err);
+    alert("Failed to allocate order lines.");
+  } finally {
+    spinner.style.display = 'none';
+  }
+}
+
+function toggleOrdersContainer() {
+  const ordersContainer = document.getElementById('orders-container');
+  const toggleBtn = document.getElementById('toggle-orders-btn');
+  if (ordersContainer.style.display === 'none') {
+    ordersContainer.style.display = 'block';
+    toggleBtn.textContent = 'Hide Orders';
+  } else {
+    ordersContainer.style.display = 'none';
+    toggleBtn.textContent = 'Show Orders';
+  }
+}
+
+  
+    function loadVisualization() {
+      fetch('visualizeLocations.html')
+        .then(res => res.text())
+        .then(html => {
+          document.getElementById('visualization-container').innerHTML = html;
+          const scripts = document.getElementById('visualization-container').querySelectorAll("script");
+          scripts.forEach(oldScript => {
+            const newScript = document.createElement("script");
+            if (oldScript.src) {
+              newScript.src = oldScript.src;
+            } else {
+              newScript.textContent = oldScript.textContent;
+            }
+            document.body.appendChild(newScript);
+          });
+        })
+        .catch(err => {
+          console.error("Failed to load visualization:", err);
+          alert("Could not load allocation visualization.");
+        });
+    }
+  
+    // Init
+    fetch('/getAllOrders')
+       .then(response => response.json())
+      .then(data => {
+        alert('Note that these are TEST orders, using real skus and locations. Allocations will not be posted to Extensiv during these tests')
+        console.log(data)
+        const grouped = groupByOrder(data);
+        renderTable(grouped);
+      })
+      .catch(err => {
+        document.getElementById('orders-container').innerHTML = '<p>Error loading orders.</p>';
+        console.error(err);
+      });
+  </script>
+  
+
+</body>
+</html>

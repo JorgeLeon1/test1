@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warehouse Dashboard | 3PL</title>
+    
+    <!-- Google Fonts & FontAwesome -->
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://kit.fontawesome.com/a076d05399.js" crossorigin="anonymous"></script>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <style>
+        :root {
+            --dark-blue: #1c3d57;
+            --light-gray: #f4f4f4;
+            --text-dark: #333;
+            --card-bg: #fff;
+            --highlight-blue: #2c5a85;
+            --accent-green: #38c7aa;
+            --shadow: rgba(0, 0, 0, 0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Roboto', sans-serif;
+        }
+
+        body {
+            display: flex;
+            background: var(--light-gray);
+            color: var(--text-dark);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: var(--dark-blue);
+            color: white;
+            padding: 30px 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            box-shadow: 2px 0 10px var(--shadow);
+        }
+
+        .logo {
+            width: 120px;
+            height: 120px;
+            background: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+
+        .logo img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+
+        .nav-links {
+            list-style: none;
+            width: 100%;
+        }
+
+        .nav-links li {
+            margin: 15px 0;
+        }
+
+        .nav-links a {
+            color: white;
+            text-decoration: none;
+            font-size: 18px;
+            padding: 12px;
+            display: block;
+            border-radius: 8px;
+            text-align: center;
+            transition: background 0.3s;
+        }
+
+        .nav-links a:hover {
+            background: var(--highlight-blue);
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        /* Charts Section */
+        .charts-container {
+            display: flex;
+            gap: 20px;
+            height: 60%;
+        }
+
+        .chart-box {
+            flex: 1;
+            background: var(--card-bg);
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 10px var(--shadow);
+        }
+
+        /* Metrics Panel */
+        .metrics-panel {
+            display: flex;
+            justify-content: space-between;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px var(--shadow);
+        }
+
+        .metric-card {
+            flex: 1;
+            margin: 10px;
+            background: var(--card-bg);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            box-shadow: 0 4px 8px var(--shadow);
+            transition: transform 0.2s;
+        }
+
+        .metric-card:hover {
+            transform: translateY(-3px);
+        }
+
+        .metric-icon i {
+            font-size: 28px;
+            color: var(--highlight-blue);
+        }
+
+        .metric-info h4 {
+            font-size: 16px;
+            font-weight: 500;
+            margin-top: 10px;
+        }
+
+        .metric-info p {
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        @media (max-width: 768px) {
+            .charts-container {
+                flex-direction: column;
+            }
+
+            .metric-card {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <nav class="sidebar">
+        <div class="logo">
+            <img src="./images/wmLogo.png" alt="Company Logo">
+        </div>
+        <ul class="nav-links">
+            <li><a href="#">Dashboard</a></li>
+            <li><a href="/order">Enter Orders</a></li>
+            <li><a href="/allocateOrders">Allocate Orders</a></li>
+            <li><a href="/seeDatabaseData">Intgeration Viewer</a></li>
+            <li><a href="/reports">Reports</a></li>
+            <li><a href="/account">Account</a></li>
+            <li><a href="/help">Help</a></li>
+        </ul>
+    </nav>
+
+    <div class="main-content">
+        <div class="charts-container">
+            <div class="chart-box">
+                <h3>Shipment Trends</h3>
+                <canvas id="lineChart"></canvas>
+            </div>
+            <div class="chart-box">
+                <h3>Order Fulfillment</h3>
+                <canvas id="barChart"></canvas>
+            </div>
+        </div>
+
+        <div class="metrics-panel">
+            <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-truck"></i></div>
+                <div class="metric-info"><h4>Picking</h4><p>Coming soon!</p></div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-dollar-sign"></i></div>
+                <div class="metric-info"><h4>Calendar</h4><p>Coming soon!</p></div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-exclamation-circle"></i></div>
+                <div class="metric-info"><h4>Staging Locations</h4><p>Coming soon!</p></div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-box"></i></div>
+                <div class="metric-info"><h4>Units of Measure</h4><p>Coming soon!</p></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Shipment Trends Line Chart
+        const lineCtx = document.getElementById('lineChart').getContext('2d');
+        new Chart(lineCtx, {
+            type: 'line',
+            data: {
+                labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May'],
+                datasets: [{
+                    label: 'Shipments',
+                    data: [120, 150, 180, 220, 250],
+                    borderColor: '#2c5a85',
+                    borderWidth: 2,
+                    fill: false
+                }]
+            },
+            options: { responsive: true }
+        });
+
+        // Order Fulfillment Bar Chart
+        const barCtx = document.getElementById('barChart').getContext('2d');
+        new Chart(barCtx, {
+            type: 'bar',
+            data: {
+                labels: ['Warehouse A', 'Warehouse B', 'Warehouse C'],
+                datasets: [{
+                    label: 'Orders Fulfilled',
+                    data: [400, 300, 450],
+                    backgroundColor: ['#1c3d57', '#38c7aa', '#2c5a85']
+                }]
+            },
+            options: { responsive: true }
+        });
+    </script>
+
+</body>
+</html>

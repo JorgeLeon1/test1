@@ -1,0 +1,36 @@
+{
+    "customerIdentifier": {
+        "id": 50
+    },
+    "facilityIdentifier": {
+        "id": "2"
+    },
+    "referenceNum": "TestAllocation",
+    "notes": "trying to get it to allocate to 53-c-01",
+    "shippingNotes": "Do not ship",
+    "billingCode": "Prepaid",
+    "routingInfo": {
+        "carrier": "UPS",
+        "mode": "92",
+        "scacCode": "UPGN",
+        "account": "12345z"
+    },
+    "shipTo": {
+        "companyName": "3PLCentral",
+        "name": "Test",
+        "address1": "222 N PCH HWY",
+        "address2": "Suite 1500",
+        "city": "EL Segundo",
+        "state": "CA",
+        "zip": "90245",
+        "country": "US"
+    },
+    "orderItems": [
+        {
+            "itemIdentifier": {
+                "sku": "GRA-2164610"
+            },
+            "qty": 2
+        }
+    ]
+}

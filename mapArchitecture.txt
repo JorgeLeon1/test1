@@ -1,0 +1,57 @@
+UI:
+
+Screens
+
+
+- customer:
+  -sees his own order, in a dashboard
+  -order statuses, shipments, etc - dunno. Needs lots of APIs, might not be worth it
+  -order entry form
+
+- wm user
+  - sees all new orders, statuses, etc.
+  - portal to enter order for any custome
+  - db error log tracking
+  - any other info has to be entered in extensiv
+   - receiving screen
+
+Pickers
+ - see digital item pick ticket entry form
+
+- trackers for following inventory
+
+ Billers-
+ just open quickbooks
+
+LOGIC
+
+  API - JS
+  getting form data and sending to db
+  getting db data and sending to portal
+  on receipt, redirect to python receiving algorithm, gets and send location to put away to
+  on pick ticket entry, routes to python for qb logic
+
+
+- hourly script (Python)
+  - checks database for all new orders
+  - runs through allocation algorithm
+  - updates the desired location in extensiv to priority 1, (and all others to 2? Have to do a whole reset...)
+  - sends order
+  - puts location back to 2 in extensiv
+  
+  - sends routing to customer, emails carrier, etc. according to a config - best if all communication is in customer portal, with predefined 
+  reponses
+
+
+DATABASE
+
+tables:
+orders
+locations (updated every - ?)
+errors
+
+
+- rhobust documentation required.
+- secure log ins
+- database!!
+

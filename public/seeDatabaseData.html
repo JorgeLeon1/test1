@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Order Grid</title>
+
+  <!-- AG Grid Styles -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-quartz.css" />
+
+  <!-- Custom Styles -->
+  <style>
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(to bottom right, #f8fafc, #e2e8f0);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 1200px;
+      width: 100%;
+      background: #f4f4f4;
+      border-radius: 1rem;
+      padding: 2rem;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    }
+
+    h1 {
+      margin-bottom: 1rem;
+      font-size: 1.8rem;
+      color: #5c6bc0;
+    }
+
+    #myGrid {
+      height: 600px;
+      width: 100%;
+      border-radius: 1rem;
+      overflow: hidden;
+    }
+    .spinner {
+    border: 8px solid #5c6bc0; 
+    border-top: 8px solid #3498db;
+    border-radius: 50%;
+    width: 60px;
+    height: 60px;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>Jool Baby and AGA Imports Integration</h1>
+    <div id="myGrid" class="ag-theme-quartz"></div>
+  </div>
+  <div id="loadingSpinner" style="
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  display: none;
+">
+<div class="spinner"></div>
+</div>
+  <!-- AG Grid Script -->
+  <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.noStyle.js"></script>
+
+  <!-- Data and Grid Setup -->
+  <script>
+    const columnDefs = [
+      { headerName: 'Order ID', field: 'orderNum', sortable: true, filter: true },
+      { headerName: 'Processed Date', field: 'date_processed', sortable: true, filter: true },
+      { headerName: 'Customer', field: 'customer', sortable: true, filter: true },
+      { headerName: 'Processed Successfully', field: 'success', sortable: true, filter: true },
+    ];
+
+    const gridOptions = {
+      columnDefs: columnDefs,
+      rowData: [],
+      pagination: true,
+      paginationPageSize: 10,
+      pagination: true,
+      paginationPageSizeSelector: [10, 50, 1000],
+      domLayout: 'normal'
+    };
+
+    // Setup the grid
+    const eGridDiv = document.getElementById('myGrid');
+    let api = agGrid.createGrid(eGridDiv, gridOptions);
+
+    // Fetch data from backend
+    const spinner = document.getElementById('loadingSpinner');
+spinner.style.display = 'block'; // Show spinner
+    fetch('/googleSpreadsheetOrders') // Replace with your actual endpoint
+      .then(response => response.json())
+      .then(data => {
+        console.log('Order data loaded:', data);
+        api.setGridOption('rowData', data)
+      })
+      .catch(error => {
+        console.error('Error loading order data:', error);
+      })  .finally(() => {
+    spinner.style.display = 'none'; // Hide spinner
+  });
+  </script>
+
+</body>
+</html>

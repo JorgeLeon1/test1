@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Display Excel File Inline</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.17.1/xlsx.full.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 10px 0;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+         table, th, td {
+            border: 1px  solid lightblue;
+        }
+        /* th, td {
+            padding: 8px;
+            text-align: left;
+        } */
+        th {
+            background-color: #f4f4f4;
+        }
+        #excelOutput {
+            display: none;
+            margin-top: 20px;
+        }
+        h1 {
+        margin-bottom: 1rem;
+        font-size: 1.8rem;
+        color: #00796b;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .btn {
+            padding: 14px 20px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            background-color: #5c6bc0;
+            color: #f4f4f4;
+            font-weight: bold;
+            transition: background-color 0.3s ease;
+        }
+
+        .btn:hover {
+            background-color: #3949ab;
+        }
+        
+    </style>
+</head>
+<body>
+
+
+
+    <!-- Buttons to control visualization -->
+    <button class="btn" id="visualizeBtn">Visualize All Locations for Allocated Skus</button>
+    <button class="btn" id="closeBtn" style="display: none;">Close Image</button>
+
+    <div class="loading"> <p>Tip for using the visualization: zoom out so that you can see more of the content, and use the search finder (ctrl f) to locate specific skus and quantities</p></div>
+    <a href="./faqs.html#cardVisualization" target="_blank">How to use the visualization</a>
+    <div>
+        <a href="WM1warehouse.xlsx" download="WM1warehouse.xlsx">
+            Download Warehouse Map With SKUs and Locations
+        </a>
+    </div>
+
+    <!-- This is where the Excel content will be displayed -->
+    <div id="excelOutput"></div>
+
+    <script>
+        // Function to handle Visualize button click
+        document.getElementById('visualizeBtn').addEventListener('click', function() {
+            // Simulate loading an Excel file (use a local or URL path here)
+            const filePath = "WM1warehouse.xlsx"; // Put your file path here
+
+            fetch(filePath)
+                .then(response => response.blob())
+                .then(blob => {
+                    const reader = new FileReader();
+                    reader.onload = function(e) {
+                        const data = e.target.result;
+                        const workbook = XLSX.read(data, { type: 'binary' });
+
+                        // Get the first sheet in the workbook
+                        const sheetName = workbook.SheetNames[0];
+                        const worksheet = workbook.Sheets[sheetName];
+
+                        // Convert the sheet to an HTML table
+                        const htmlTable = XLSX.utils.sheet_to_html(worksheet);
+
+                        // Display the table inline
+                        document.getElementById('excelOutput').innerHTML = htmlTable;
+                        document.getElementById('excelOutput').style.display = "block"; // Show table
+                        document.getElementById('visualizeBtn').style.display = "none"; // Hide Visualize button
+                        document.getElementById('closeBtn').style.display = "inline"; // Show Close button
+                    };
+                    reader.readAsBinaryString(blob);
+                })
+                .catch(error => {
+                    console.error("Error loading file:", error);
+                    alert("Failed to load the file.");
+                });
+        });
+
+        // Function to handle Close button click
+        document.getElementById('closeBtn').addEventListener('click', function() {
+            document.getElementById('excelOutput').style.display = "none"; // Hide table
+            document.getElementById('visualizeBtn').style.display = "inline"; // Show Visualize button
+            document.getElementById('closeBtn').style.display = "none"; // Hide Close button
+        });
+    </script>
+
+</body>
+</html>

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Order Grid Report</title>
+  <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.noStyle.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine.css">
+  <style>
+    h2  {
+    margin-bottom: 1rem;
+    font-size: 1.8rem;
+    color: #00796b;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f4f4f9;
+    }
+    .status-buttons {
+      margin-bottom: 10px;
+    }
+    .status-buttons button {
+      margin-right: 10px;
+      padding: 8px 15px;
+      border: none;
+      background: #5c6bc0;
+      color: white;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    .status-buttons button:hover {
+      background: #0056b3;
+    }
+    .ag-theme-alpine {
+      height: 600px;
+      width: 100%;
+    }
+    .status-open {
+      background-color: #fff3cd !important;
+    }
+    .status-picked {
+      background-color: #d1ecf1 !important;
+    }
+    .status-shipped {
+      background-color: #d4edda !important;
+    }
+    .status-completed {
+      background-color: #c3e6cb !important;
+    }
+  </style>
+</head>
+<body>
+  <h2>Order Report</h2>
+
+  <div class="status-buttons">
+    <button onclick="exportRows()">Export To CSV</button>
+
+    <!-- <button onclick="filterByStatus('Open')">Open</button>
+    <button onclick="filterByStatus('Picked')">Picked</button>
+    <button onclick="filterByStatus('Shipped')">Shipped</button>
+    <button onclick="filterByStatus('Completed')">Completed</button>-->
+  </div> 
+
+
+  <div id="myGrid" class="ag-theme-alpine"></div>
+
+  <script>
+    let gridApi;
+    let gridColumnApi;
+
+    const columnDefs = [
+      { headerName: "Order ID", field: "orderId", sortable: true, filter: true },
+      { headerName: "Customer", field: "customer", sortable: true, filter: true },
+      { headerName: "Order Date", field: "orderDate", sortable: true, filter: "agDateColumnFilter" },
+      { headerName: "Shipped Date", field: "shippedDate", sortable: true, filter: "agDateColumnFilter" },
+      { headerName: "SKU", field: "sku", sortable: true, filter: true },
+      { headerName: "Quantity", field: "quantity", sortable: true, filter: true },
+      { headerName: "PO", field: "po", sortable: true, filter: true },
+      { headerName: "Package Count", field: "packageCount", sortable: true, filter: true },
+      { headerName: "Pallet Count", field: "palletCount", sortable: true, filter: true },
+      { headerName: "Destination", field: "destination", sortable: true, filter: true },
+      { headerName: "Status", field: "status", sortable: true, filter: true,
+        cellClassRules: {
+          'status-open': params => params.value === 'Open',
+          'status-picked': params => params.value === 'Picked',
+          'status-shipped': params => params.value === 'Shipped',
+          'status-completed': params => params.value === 'Completed'
+        }
+      }
+    ];
+
+    const sampleData = [
+      {
+        orderId: "ORD001",
+        customer: "Customer A",
+        orderDate: "2025-04-01",
+        shippedDate: "2025-04-03",
+        sku: "SKU123",
+        quantity: 10,
+        po: "PO1001",
+        packageCount: 2,
+        palletCount: 1,
+        destination: "New York",
+        status: "Open"
+      },
+      {
+        orderId: "ORD002",
+        customer: "Customer B",
+        orderDate: "2025-04-02",
+        shippedDate: "2025-04-04",
+        sku: "SKU124",
+        quantity: 20,
+        po: "PO1002",
+        packageCount: 3,
+        palletCount: 1,
+        destination: "Los Angeles",
+        status: "Picked"
+      },
+      {
+        orderId: "ORD003",
+        customer: "Customer C",
+        orderDate: "2025-04-03",
+        shippedDate: "2025-04-05",
+        sku: "SKU125",
+        quantity: 15,
+        po: "PO1003",
+        packageCount: 4,
+        palletCount: 2,
+        destination: "Chicago",
+        status: "Shipped"
+      },
+      {
+        orderId: "ORD004",
+        customer: "Customer D",
+        orderDate: "2025-04-04",
+        shippedDate: "2025-04-06",
+        sku: "SKU126",
+        quantity: 5,
+        po: "PO1004",
+        packageCount: 1,
+        palletCount: 1,
+        destination: "Houston",
+        status: "Completed"
+      }
+    ];
+
+    const gridOptions = {
+      columnDefs: columnDefs,
+      rowData: sampleData, // Using sample data for preview
+      defaultColDef: {
+        flex: 1,
+        minWidth: 110,
+        resizable: true
+      },
+      onGridReady: params => {
+        gridApi = params.api;
+        gridColumnApi = params.columnApi;
+
+        // Uncomment below to use backend data
+        // fetch('/allOrders')
+        //   .then(response => response.json())
+        //   .then(data => gridApi.setRowData(data));
+      }
+    };
+
+    function filterByStatus(status) {
+      gridApi.setQuickFilter('');
+      gridApi.setFilterModel({
+        status: { type: 'equals', filter: status }
+      });
+      gridApi.onFilterChanged();
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      const gridDiv = document.getElementById('myGrid');
+       let gridApi = agGrid.createGrid(gridDiv, gridOptions);
+    });
+
+    function exportRows() {
+            try {
+                if (confirm('Only visible data (after filtering) will be exported.')) gridApi.exportDataAsCsv();
+            } catch (e) {
+                console.log(e);
+            }
+        }
+  </script>
+</body>
+</html>

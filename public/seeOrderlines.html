@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Order Lines</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background: #f9fafb;
+      margin: 2rem;
+    }
+    h2 {
+      color: #374151;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 2rem;
+      background: white;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    thead {
+      background-color: #e5e7eb;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid #e5e7eb;
+      text-align: left;
+    }
+    tr.group-header {
+      background-color: #f3f4f6;
+      font-weight: bold;
+    }
+    tr:hover td {
+      background-color: #f0fdf4;
+    }
+    input[type="checkbox"] {
+      transform: scale(1.2);
+    }
+    .loading {
+      font-style: italic;
+      color: #6b7280;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Pending Orders by Order</h2>
+  <div id="orders-container">
+    <p class="loading">Loading orders...</p>
+  </div>
+
+  <script>
+    async function fetchOrderLines() {
+      //const res = await fetch('/api/order-lines');
+      // const data = await res.json();
+    const data = [
+      { "id": 1, "orderNumber": "1001", "customer": "Alice", "sku": "A123", "quantity": 2 },
+      { "id": 2, "orderNumber": "1001", "customer": "Alice", "sku": "B456", "quantity": 1 },
+      { "id": 3, "orderNumber": "1002", "customer": "Bob", "sku": "C789", "quantity": 4 }
+    ]
+      return data; // Array of { orderNumber, customer, sku, quantity }
+    }
+
+    function groupByOrder(data) {
+      return data.reduce((acc, line) => {
+        const key = `${line.orderNumber} | ${line.customer}`;
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(line);
+        return acc;
+      }, {});
+    }
+
+    function renderTable(groupedData) {
+      const container = document.getElementById('orders-container');
+      container.innerHTML = '';
+
+      for (const groupKey in groupedData) {
+        const [orderNumber, customer] = groupKey.split(' | ');
+        const lines = groupedData[groupKey];
+
+        const table = document.createElement('table');
+        const thead = document.createElement('thead');
+        thead.innerHTML = `
+          <tr class="group-header">
+            <td colspan="5">Order #${orderNumber} – ${customer}</td>
+          </tr>
+          <tr>
+            <th>SKU</th>
+            <th>Quantity</th>
+          </tr>
+        `;
+
+        const tbody = document.createElement('tbody');
+        for (const line of lines) {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${line.sku}</td>
+            <td>${line.quantity}</td>
+          `;
+          tbody.appendChild(row);
+        }
+
+        table.appendChild(thead);
+        table.appendChild(tbody);
+        container.appendChild(table);
+      }
+    }
+
+    // On page load
+    fetchOrderLines()
+      .then(data => {
+        const grouped = groupByOrder(data);
+        renderTable(grouped);
+      })
+      .catch(err => {
+        document.getElementById('orders-container').innerHTML = '<p>Error loading orders.</p>';
+        console.error(err);
+      });
+  </script>
+
+</body>
+</html>

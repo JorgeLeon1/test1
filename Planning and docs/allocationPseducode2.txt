@@ -1,0 +1,106 @@
+# temp:
+ 
+ - receiving 
+   - all ecom receipts on column A< can be divided by customer, and other customers will have more racks
+   - algorithm checks how frequently item is used, and the empty space by the customer, and determines best location for the item
+      where they should put it away
+    - more common items go closer to end of aisle, and lower down
+    - keeps track of expiration dates
+ 
+ 
+ 
+
+
+
+# permanent:
+
+- driver is about to pick
+- he gets directed by the calendar to the correct door
+- he tells app he wants to pick
+
+- ***q. does he need to pick his own orders? Maybe he should pick what's closest?
+
+
+lets say his cus is closest:
+
+   - app finds the skus nearest him, from *** all outgoing orders? Only his orders? :
+     'SELECT skus and locations from database where scheduled pick up is now'
+     -allocations  algorithm :
+        *** is he anyway doing one at a time, so matters close to aisle, not close to each other?
+          - normal, choose 'lower' letter over higher letter'
+            - choose lower bin over higher bin
+            - if an item is reaching 'exp date', choose that item anyway
+            - mark those locations as picked, so move their inventory to where extensiv believes was picked
+
+            - behind the scenes, move items in extensiv, so it doesn't realize its been overridden?
+
+          - ecom orders :
+            - find the skus closest to each other
+            - use the levison distance algorthim, All should be smae letter, so question of racks and bins only.
+            - find the best route - here to there
+            - utilize partial pallets over full pallets, as long as the distance is not too long
+
+
+tables:
+ 
+locations, joined to-
+inventory, joined to-
+orders, joined to-
+customer
+carriers and their scheduled arrivals
+
+
+
+For clarity:
+
+Keep a rolling 30/60/90-day SKU movement report.
+Assign faster-moving SKUs lower and closer to the main pick path.
+Prioritize “golden zones” (eye level and lower) for fast movers.
+Keep seasonal trends in mind (e.g., winter jackets closer in October).
+Dynamic Storage Allocation
+
+If a SKU is slowing down, move it higher or deeper into the racks.
+Use machine learning (if available as a package, too time consuming to learn now) to suggest relocations dynamically.
+Ecom vs. Retail Separation
+
+Dedicate prime ecom slots near packing stations.
+Retail bulk storage can be in higher, less accessible areas.
+Picking Algorithm Improvements
+1. Batch Picking & Optimization
+Does the driver pick his own orders?
+
+For ecom: He should batch-pick orders in a cluster, not one at a time.
+For retail: If orders are pallet-based, he should pick the closest one.
+Should he pick only his orders or all?
+
+If multiple pickers exist, a dynamic system should assign picks based on proximity and urgency (e.g., closest expiring items).
+2. Prioritization Rules
+Proximity to Aisle Matters More Than Proximity to Other Items (for Retail)
+
+For bulk picking, prioritize endcap racks.
+Pallets should be taken from lower first.
+Letter & Bin Rules for Ecom (Pick Path Efficiency)
+
+Use Levenshtein Distance to find the best pick sequence.
+Group SKUs within a 1-2 bin range if possible.
+Lower bins get priority over higher bins.
+Expiration-Driven Picks
+
+If an item is close to expiration, override normal pick logic.
+System should flag when override occurs for reporting.
+Partial Pallet Preference for Ecom
+
+Always prefer breaking into partial pallets first unless the distance is excessive.
+System Implementation Suggestions
+Pick Confirmation Process
+
+Every pick should be confirmed in the system before the next location is assigned.
+If overrides occur (e.g., picker grabs from a different bin), the system should automatically update Extensiv in real-time.
+Dynamic Route Optimization
+
+If more than 5 SKUs need picking, generate an optimal route dynamically.
+Can use Dijkstra’s Algorithm or a Shortest Path Heuristic.
+Final Thoughts
+If you have barcode scanning, ensure scans confirm the right SKU at pickup.
+Consider implementing wave picking for high-volume times.
+Use heatmaps to analyze pick paths and optimize slotting over time.

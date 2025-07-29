@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reports Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-alpine.css">
+  <style>
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f4f4f9;
+      color: #333;
+    }
+
+    header {
+      padding: 20px;
+      background-color: #ffffff;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      text-align: center;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+    }
+
+    .reports-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      padding: 30px;
+    }
+
+    .report-card {
+      background-color: #ffffff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+      transition: transform 0.2s ease-in-out;
+      cursor: pointer;
+    }
+
+    .report-card:hover {
+      transform: translateY(-5px);
+    }
+
+    .report-title {
+      font-size: 20px;
+      margin-bottom: 10px;
+      color: #007bff;
+    }
+
+    .report-description {
+      font-size: 14px;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Reports Dashboard</h1>
+  </header>
+
+  <div class="reports-container">
+    <div class="report-card" onclick="location.href='seeOrderHeadersAndLines.html'">
+      <div class="report-title">Orders Report</div>
+      <div class="report-description">View and filter all orders by status, date, customer, SKU, and more.</div>
+    </div>
+
+    <div class="report-card">
+      <div class="report-title">Inventory Report</div>
+      <div class="report-description">Track current inventory levels, reorder alerts, and stock trends. - Not Live</div>
+    </div>
+
+    <div class="report-card">
+      <div class="report-title">Shipment Report</div>
+      <div class="report-description">Analyze shipped orders, destinations, and shipment performance. - Not Live</div>
+    </div>
+
+    <div class="report-card">
+      <div class="report-title">Returns Report</div>
+      <div class="report-description">Monitor returned items, reasons for return, and resolution status. - Not Live</div>
+    </div>
+  </div>
+</body>
+</html>

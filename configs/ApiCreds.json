@@ -1,0 +1,12 @@
+{
+    "admin":{
+        "user_id": 0,
+        "client_secret": "Y5HWEIS1eGPR7Lov2Q/LlcbgsOsvyjxR",
+        "client_id": "17bf7876-58a7-4c0d-832a-6036c15a05a7"    
+    },    
+    "Oline": {
+        "user_id": 25,
+        "client_secret": "56jlCPugJGip1GH8PnpUAOOWHX3vBmfh",
+        "client_id": "86734f6f-fb9b-4cad-a0a3-d7b4531c0393"
+    }
+}

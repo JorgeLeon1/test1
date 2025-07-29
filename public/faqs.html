@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FAQs</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f4f4f9;
+      color: #333;
+    }
+
+    header {
+      padding: 20px;
+      background-color: #ffffff;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      text-align: center;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+    }
+
+    .faq-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      padding: 30px;
+    }
+
+    .faq-card {
+      background-color: #ffffff;
+      padding: 20px;
+      border-radius: 12px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+      transition: transform 0.2s ease-in-out, background-color 0.6s ease, border 0.6s ease;
+    }
+
+    .faq-card:hover {
+      transform: translateY(-5px);
+    }
+
+    .faq-question {
+      font-size: 18px;
+      margin-bottom: 10px;
+      color: #007bff;
+    }
+
+    .faq-answer {
+      font-size: 14px;
+      color: #555;
+    }
+    .faq-card.pop {
+  animation: popOut 1s ease;
+  box-shadow: 0 0 15px rgba(0,0,0,0.3);
+  transform: scale(1.03);
+  background-color: #e6f2ff; /* Light blue highlight */
+  border: 2px solid #007bff;
+}
+
+@keyframes popOut {
+  0% { transform: scale(1); box-shadow: none; }
+  50% { transform: scale(1.05); box-shadow: 0 0 20px rgba(0,0,0,0.4); }
+  100% { transform: scale(1.03); box-shadow: 0 0 15px rgba(0,0,0,0.3); }
+}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Frequently Asked Questions</h1>
+  </header>
+
+  <div class="faq-container">
+    <div class="faq-card" id="cardVisualization">
+      <div class="faq-question">How should I use the location visualization on the allocation page?</div>
+      <div class="faq-answer"><p><strong>Tip:</strong> Visualizing a location within the warehouse can often provide valuable context when determining whether it is the most appropriate spot for allocation.</p>
+
+        <p><strong>Recommendation:</strong> Review the visual layout of locations—this may be easiest using the downloaded version of the data. Consider how you would allocate items manually, then compare this with the algorithm’s allocation.</p>
+        
+        <p>If there are differences, try to infer the reason behind them. This often helps clarify whether the system logic aligns with your intended strategy, and where adjustments may be necessary.</p>
+        
+        <p>If you have any questions or require further clarification, please don't hesitate to contact us via the Help menu.</p>
+      </div>
+    </div>
+    
+    <div class="faq-card">
+      <div class="faq-question">How often is the portal updated?</div>
+      <div class="faq-answer"><strong>New!</strong> Data is updated automatically as new features are included! Check the portal as often as you'd like - new additions are being added all the time.</div>
+    </div>
+    
+    <div class="faq-card">
+      <div class="faq-question">Can I export report data?</div>
+      <div class="faq-answer">Yes, most reports support CSV export. Look for the export button at the top-left of each report.</div>
+    </div>
+    
+    <div class="faq-card">
+      <div class="faq-question">What are the 3 ways I can enter orders?</div>
+      <div class="faq-answer">940s, custom, manual - to be continued in depth</div>
+    </div>
+  </div>
+</body>
+<script>
+    window.addEventListener("DOMContentLoaded", () => {
+      const hash = window.location.hash;
+      if (hash) {
+        const card = document.querySelector(hash);
+        if (card) {
+          card.classList.add("pop");
+          setTimeout(() => card.classList.remove("pop"), 1500); // remove after animation
+        }
+      }
+    });
+  </script>
+</html>

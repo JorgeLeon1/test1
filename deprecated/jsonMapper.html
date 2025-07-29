@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>JSON to Fields Mapper</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #f5f7fa;
+      padding: 40px;
+      color: #333;
+    }
+    h2 {
+      text-align: center;
+      color: #444;
+      margin-bottom: 30px;
+    }
+    .container {
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      max-width: 800px;
+      margin: auto;
+    }
+    label {
+      font-weight: 600;
+      margin-top: 20px;
+      display: block;
+      font-size: 14px;
+    }
+    input[type="file"], select, button {
+      width: 100%;
+      margin-top: 8px;
+      padding: 10px;
+      font-size: 14px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+    }
+    button {
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      margin-top: 20px;
+      cursor: pointer;
+      transition: background-color 0.3s;
+    }
+    button:hover {
+      background-color: #45a049;
+    }
+    #mappingForm {
+      margin-top: 30px;
+    }
+    #output {
+      margin-top: 30px;
+      background: #eef2f7;
+      padding: 20px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h2>JSON Field Mapper</h2>
+
+  <label for="excelFile">Upload Excel File (.xlsx):</label>
+  <input type="file" id="excelFile" accept=".xlsx" />
+
+  <button onclick="generateForm()">Generate Fields</button>
+
+  <form id="mappingForm"></form>
+
+  <button onclick="saveMapping()" id="saveBtn" style="display:none;">View Generated Mapping</button>
+
+  <h3>Final Mapping Output:</h3>
+  <pre id="output"></pre>
+</div>
+
+<script>
+  let excelHeaders = [];
+  let jsonTemplate = {};
+
+  // Load static JSON from ./template/mapping.json
+  window.onload = function() {
+    fetch('./template/templateDownload.json')
+      .then(response => {
+        if (!response.ok) {
+          throw new Error('Could not load mapping.json');
+        }
+        return response.json();
+      })
+      .then(data => {
+        jsonTemplate = data;
+      })
+      .catch(error => {
+        alert('Error loading JSON template: ' + error.message);
+      });
+  };
+
+  document.getElementById('excelFile').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(evt) {
+      const data = new Uint8Array(evt.target.result);
+      const workbook = XLSX.read(data, {type: 'array'});
+      const firstSheetName = workbook.SheetNames[0];
+      const worksheet = workbook.Sheets[firstSheetName];
+      const headers = XLSX.utils.sheet_to_json(worksheet, {header: 1})[0];
+      excelHeaders = headers;
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  function generateForm() {
+    if (!excelHeaders.length) {
+      alert('Please upload an Excel file first.');
+      return;
+    }
+
+    const form = document.getElementById('mappingForm');
+    form.innerHTML = ''; // Clear previous form
+
+    Object.keys(jsonTemplate).forEach(key => {
+      const label = document.createElement('label');
+      label.textContent = key;
+
+      const select = document.createElement('select');
+      select.name = key;
+      excelHeaders.forEach(header => {
+        const option = document.createElement('option');
+        option.value = header;
+        option.textContent = header;
+        select.appendChild(option);
+      });
+
+      form.appendChild(label);
+      form.appendChild(select);
+    });
+
+    document.getElementById('saveBtn').style.display = 'block';
+  }
+
+  function saveMapping() {
+    event.preventDefault(); // Prevent form submit reload
+    const form = document.getElementById('mappingForm');
+    const mapping = {};
+
+    Array.from(form.elements).forEach(select => {
+      if (select.tagName === 'SELECT') {
+        mapping[select.name] = select.value;
+      }
+    });
+
+    document.getElementById('output').textContent = JSON.stringify(mapping, null, 2);
+  }
+</script>
+
+</body>
+</html>
