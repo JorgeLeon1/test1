@@ -5,9 +5,9 @@ import getAccessToken from './getAccessToken';
 let config = {
   method: 'get',
   maxBodyLength: Infinity,
-  url: 'https://secure-wms.com/properties/facilities/locations?pgnum=45', // TODO: make this dynamic. Add pagination
+  url: 'https://box.secure-wms.com/properties/facilities/locations?pgnum=45', // TODO: make this dynamic. Add pagination
   headers: { 
-    'Host': 'secure-wms.com', 
+    'Host': 'box.secure-wms.com', 
     'Content-Type': 'application/json; charset=utf-8', 
     'Accept': 'application/hal+json', 
     'Authorization': `Bearer ${await (getAccessToken()).access_token}`,
