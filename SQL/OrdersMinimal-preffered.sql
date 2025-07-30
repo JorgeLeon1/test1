@@ -26,3 +26,25 @@ CREATE TABLE OrderItems (
     sku VARCHAR(100) NOT NULL,
     qty INT NOT NULL
 );
+
+
+CREATE TABLE Inventory (
+    CustomerName VARCHAR(100) NOT NULL,
+    CustomerID INT NOT NULL,
+    ReceiverId INT NOT NULL,
+    ReceiveDate DATE NOT NULL,
+    ReceiveItemID INT NOT NULL PRIMARY KEY,
+    ItemID INT NOT NULL,
+    SKU VARCHAR(50) NOT NULL,
+    UnitID INT NOT NULL,
+    UnitName VARCHAR(50) NOT NULL,
+    Qualifier VARCHAR(50),
+    LocationName VARCHAR(100) NOT NULL,
+    LocationID INT NOT NULL,
+    PalletName VARCHAR(100),
+    PalletID INT,
+    ReceivedQTY DECIMAL(10, 4) NOT NULL,
+    OnHandQTY DECIMAL(10, 4) NOT NULL,
+    AvailableQTY DECIMAL(10, 4) NOT NULL,
+);
+
