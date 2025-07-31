@@ -48,3 +48,17 @@ CREATE TABLE Inventory (
     AvailableQTY DECIMAL(10, 4) NOT NULL,
 );
 
+CREATE TABLE OrderDetails (
+    OrderID INT NOT NULL,
+    OrderItemID INT NOT NULL PRIMARY KEY,
+    CustomerName VARCHAR(100),
+    CustomerID INT NOT NULL,
+    ItemID INT NOT NULL,
+    SKU VARCHAR(50) NOT NULL,
+    UnitID INT NOT NULL,
+    UnitName VARCHAR(50) NOT NULL,
+    Qualifier VARCHAR(50),
+    OrderedQTY DECIMAL(10, 4) NOT NULL,
+    ReferenceNum VARCHAR(50),
+    ShipToAddress VARCHAR(255),
+);
