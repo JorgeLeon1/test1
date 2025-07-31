@@ -62,3 +62,27 @@ CREATE TABLE OrderDetails (
     ReferenceNum VARCHAR(50),
     ShipToAddress VARCHAR(255),
 );
+
+CREATE TABLE OrderDetails (
+    OrderID INT NOT NULL,
+    OrderItemID INT NOT NULL PRIMARY KEY,
+    CustomerName VARCHAR(100),
+    CustomerID INT NOT NULL,
+    ItemID INT NOT NULL,
+    SKU VARCHAR(50) NOT NULL,
+    UnitID INT NOT NULL,
+    UnitName VARCHAR(50) NOT NULL,
+    Qualifier VARCHAR(50),
+    OrderedQTY DECIMAL(10, 4) NOT NULL,
+    ReferenceNum VARCHAR(50),
+    ShipToAddress VARCHAR(255),
+);
+
+-- Insert sample data from provided JSON
+INSERT INTO OrderDetails (
+    OrderID, OrderItemID, CustomerName, CustomerID, ItemID, SKU, 
+    UnitID, UnitName, Qualifier, OrderedQTY, ReferenceNum, ShipToAddress
+)
+VALUES 
+(208127, 354954, 'Jool Baby', 47, 8054, 'PT-QF-1-WT-LNG', 1, 'Each', '', 275.0000, 'FBA18Z6TY6BJ', 'Amazon.com, 255 Park Center Drive, Patterson, CA 95363-8876, US'),
+(208127, 354955, 'Jool Baby', 47, 8257, 'DP-CPAD-2-GY', 1, 'Each', '', 24.0000, 'FBA18Z6TY6BJ', 'Amazon.com, 255 Park Center Drive, Patterson, CA 95363-8876, US');
