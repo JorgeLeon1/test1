@@ -55,8 +55,8 @@
 
   <script>
     async function fetchOrderLines() {
-      //const res = await fetch('/api/order-lines');
-      // const data = await res.json();
+      const res = await fetch('/api/order-lines');
+       const data = await res.json();
     const data = [
       { "id": 1, "orderNumber": "1001", "customer": "Alice", "sku": "A123", "quantity": 2 },
       { "id": 2, "orderNumber": "1001", "customer": "Alice", "sku": "B456", "quantity": 1 },
