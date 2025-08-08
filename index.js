@@ -13,6 +13,9 @@ import allocateOrders from './app/allocateOrder.js';
 import axios from 'axios';
 // import deotenv
 import dotenv from 'dotenv';
+import extensiv from './app/routes/extensiv.js';
+app.use('/extensiv', extensiv);
+
 
 dotenv.config();
 
