@@ -1,9 +1,18 @@
+// app/services/extensivClient.js
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-function authHeaders() {
+export function authHeaders() {
   const basic = Buffer.from(`${process.env.EXT_API_KEY}:${process.env.EXT_API_SECRET}`).toString("base64");
-  return { Authorization: `Basic ${basic}`, Accept: "application/json" };
+  const h = {
+    Authorization: `Basic ${basic}`,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  // If your tenant requires these, keep; otherwise keep as blank strings or remove.
+  if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
+  if (process.env.EXT_CUSTOMER_ID) h["3PL-Customer-Id"] = process.env.EXT_CUSTOMER_ID;
+  return h;
 }
 
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
@@ -11,11 +20,20 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
   const pool = await getPool();
 
   while (true) {
-    const { data } = await axios.get(`${process.env.EXT_BASE_URL}/orders`, {
-      headers: authHeaders(),
-      params: { modifiedDateStart: modifiedSince, status, page, pageSize }
-    });
-    const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+    let list = [];
+    try {
+      const resp = await axios.get(`${process.env.EXT_BASE_URL}/orders`, {
+        headers: authHeaders(),
+        params: { modifiedDateStart: modifiedSince, status, page, pageSize }
+      });
+      const data = resp.data;
+      list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error("[Extensiv import] HTTP error",
+        err.response?.status, err.response?.data || err.message);
+      throw err;
+    }
+
     if (!list.length) break;
 
     const tx = new sql.Transaction(pool);
@@ -42,6 +60,7 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
       await tx.commit();
     } catch (e) {
       await tx.rollback();
+      console.error("[SQL upsert error]", e);
       throw e;
     }
 
