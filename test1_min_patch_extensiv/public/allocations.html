@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Allocations</title></head>
+<body>
+  <h1>Extensiv Allocations</h1>
+  <button id="btnImport">Import Orders</button>
+  <button id="btnAllocate">Run Allocation</button>
+  <button id="btnPush">Push to Extensiv</button>
+  <pre id="out" style="white-space:pre-wrap;border:1px solid #ccc;padding:8px;margin-top:12px;"></pre>
+  <script>
+    const out = document.getElementById('out');
+    const api = (p, body) =>
+      fetch(p, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) })
+        .then(r => r.json());
+    document.getElementById('btnImport').onclick = async () => {
+      out.textContent = 'Importing...';
+      const res = await api('/extensiv/import', { modifiedSince: '2025-07-01T00:00:00Z', status: 'AWAITINGPICK' });
+      out.textContent = JSON.stringify(res, null, 2);
+    };
+    document.getElementById('btnAllocate').onclick = async () => {
+      out.textContent = 'Allocating...';
+      const res = await api('/extensiv/allocate');
+      out.textContent = JSON.stringify(res, null, 2);
+    };
+    document.getElementById('btnPush').onclick = async () => {
+      out.textContent = 'Pushing to Extensiv...';
+      const res = await api('/extensiv/push');
+      out.textContent = JSON.stringify(res, null, 2);
+    };
+  </script>
+</body>
+</html>
