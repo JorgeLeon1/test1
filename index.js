@@ -16,8 +16,10 @@ import dotenv from 'dotenv';
 import extensiv from './app/routes/extensiv.js';
 app.use('/extensiv', extensiv);
 
+dotenv.config(); // loads .env locally; harmless on Render
 
-dotenv.config();
+console.log('SQL server is:', process.env.SQL_SERVER); // optional debug
+
 
 
 const app = express();
