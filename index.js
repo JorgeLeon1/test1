@@ -1,28 +1,34 @@
 import express from 'express';
 import session from 'express-session';
-import bodyParser from 'body-parser';
+// import bodyParser from 'body-parser';  // not needed, express has built-ins
 import multer from 'multer';
 import path from 'path';
 import { dirname } from 'path';
 import { fileURLToPath } from 'url';
 import cors from 'cors';
-import fs from 'fs'
+import fs from 'fs';
 import connectToDatabase from './connectTodb.js';
 import nodemailer from 'nodemailer';
 import allocateOrders from './app/allocateOrder.js';
 import axios from 'axios';
-// import deotenv
+
+// 1) Load env FIRST
 import dotenv from 'dotenv';
+dotenv.config();
+
+// 2) Create the Express app BEFORE using it
+const app = express();
+app.use(express.json());
+app.use(cors());
+app.use(express.urlencoded({ extended: true }));
+
+// 3) Mount routes AFTER app exists
 import extensiv from './app/routes/extensiv.js';
 app.use('/extensiv', extensiv);
 
-dotenv.config(); // loads .env locally; harmless on Render
+// (optional debug)
+console.log('SQL server is:', process.env.SQL_SERVER);
 
-console.log('SQL server is:', process.env.SQL_SERVER); // optional debug
-
-
-
-const app = express();
 app.use(express.json());
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
