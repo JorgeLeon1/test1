@@ -6,7 +6,7 @@ import { pushAllocations } from "../services/pushAllocations.js";
 
 const r = Router();
 
-r.get('/_debug', (_req, res) => {
+r.get("/_debug", (_req, res) => {
   res.json({
     routeMounted: true,
     envPresent: {
@@ -17,64 +17,114 @@ r.get('/_debug', (_req, res) => {
       EXT_USER_LOGIN: !!process.env.EXT_USER_LOGIN,
       EXT_USER_LOGIN_ID: !!process.env.EXT_USER_LOGIN_ID,
       EXT_CUSTOMER_IDS: !!process.env.EXT_CUSTOMER_IDS,
-      EXT_FACILITY_IDS: !!process.env.EXT_FACILITY_IDS
-    }
+      EXT_FACILITY_IDS: !!process.env.EXT_FACILITY_IDS,
+    },
   });
 });
 
-// Token probe (lets us confirm OAuth succeeded)
-r.get('/token', async (_req, res) => {
+// Token probe
+r.get("/token", async (_req, res) => {
   try {
     const h = await authHeaders();
-    const bearer = h.Authorization?.split(' ')[1] || '';
-    res.json({ ok: true, tokenLen: bearer.length, head: bearer.slice(0,12), tail: bearer.slice(-8) });
+    const [scheme, value = ""] = (h.Authorization || "").split(" ");
+    res.json({
+      ok: true,
+      scheme,
+      tokenLen: value.length,
+      head: value.slice(0, 12),
+      tail: value.slice(-8),
+    });
   } catch (e) {
-    res.status(500).json({ ok:false, status:e.response?.status, data:e.response?.data || e.message });
+    res
+      .status(500)
+      .json({ ok: false, status: e.response?.status, data: e.response?.data || e.message });
   }
 });
 
-// Try common header/path combos to see what your tenant wants
-r.get('/ping2', async (_req, res) => {
-  const base = (process.env.EXT_BASE_URL || '').replace(/\/+$/, '');
-  const h0 = await authHeaders();
-  const combos = [
-    { path: '/api/v1/orders', label: 'v1 + Customer/Facility',
-      hdrs: h => ({ ...h, CustomerIds: process.env.EXT_CUSTOMER_IDS || 'ALL', FacilityIds: process.env.EXT_FACILITY_IDS || 'ALL' }) },
-    { path: '/orders',        label: 'legacy + Customer/Facility',
-      hdrs: h => ({ ...h, CustomerIds: process.env.EXT_CUSTOMER_IDS || 'ALL', FacilityIds: process.env.EXT_FACILITY_IDS || 'ALL' }) },
-    { path: '/api/v1/orders', label: 'v1 + 3PL Warehouse/Customer',
-      hdrs: h => ({ ...h, '3PL-Warehouse-Id': process.env.EXT_WAREHOUSE_ID || '', '3PL-Customer-Id': process.env.EXT_CUSTOMER_ID || '' }) },
-    { path: '/orders',        label: 'legacy + 3PL Warehouse/Customer',
-      hdrs: h => ({ ...h, '3PL-Warehouse-Id': process.env.EXT_WAREHOUSE_ID || '', '3PL-Customer-Id': process.env.EXT_CUSTOMER_ID || '' }) },
-  ];
+// ---- FIXED: never send page/pageSize to legacy /orders ----
+r.get("/ping2", async (req, res) => {
+  const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com").replace(/\/+$/, "");
+  const tried = [];
+  try {
+    const headers = await authHeaders();
 
-  const results = [];
-  for (const c of combos) {
-    const url = base + c.path;
-    try {
-      const resp = await axios.get(url, { headers: c.hdrs(h0), params: { page:1, pageSize:1 } });
-      return res.json({ ok:true, winner:{ url, headerSet:c.label }, sample: resp.data?.data?.[0] || resp.data });
-    } catch (e) {
-      results.push({ url, headerSet:c.label, status:e.response?.status || null, data:e.response?.data || String(e.message) });
+    const scopeQP = {};
+    if (process.env.EXT_CUSTOMER_IDS) {
+      scopeQP.customerIds = process.env.EXT_CUSTOMER_IDS;
+      scopeQP.customerIDs = process.env.EXT_CUSTOMER_IDS;
     }
+    if (process.env.EXT_FACILITY_IDS) {
+      scopeQP.facilityIds = process.env.EXT_FACILITY_IDS;
+      scopeQP.facilityIDs = process.env.EXT_FACILITY_IDS;
+    }
+
+    const filterQP = {
+      ...(req.query.status ? { status: req.query.status } : {}),
+      ...(req.query.modifiedSince ? { modifiedDateStart: req.query.modifiedSince } : {}),
+    };
+
+    // 1) Legacy first — NO paging params
+    try {
+      const url = `${base}/orders`;
+      const params = { ...scopeQP, ...filterQP };
+      const resp = await axios.get(url, { headers, params, timeout: 15000 });
+      const data = resp.data;
+      const count = Array.isArray(data?.data) ? data.data.length : Array.isArray(data) ? data.length : null;
+      return res.json({ ok: true, winner: url, status: resp.status, count });
+    } catch (e) {
+      tried.push({
+        url: `${base}/orders`,
+        status: e.response?.status || null,
+        data: e.response?.data || String(e),
+      });
+    }
+
+    // 2) v1 next — WITH paging
+    try {
+      const url = `${base}/api/v1/orders`;
+      const params = { ...scopeQP, ...filterQP, page: 1, pageSize: 50 };
+      const resp = await axios.get(url, { headers, params, timeout: 15000 });
+      const data = resp.data;
+      const count = Array.isArray(data?.data) ? data.data.length : Array.isArray(data) ? data.length : null;
+      return res.json({ ok: true, winner: url, status: resp.status, count });
+    } catch (e) {
+      tried.push({
+        url: `${base}/api/v1/orders`,
+        status: e.response?.status || null,
+        data: e.response?.data || String(e),
+      });
+    }
+
+    return res.status(500).json({ ok: false, tried });
+  } catch (e) {
+    return res.status(500).json({ ok: false, err: e.message, tried });
   }
-  res.status(500).json({ ok:false, tried: results });
 });
 
-// Your action endpoints
-r.post('/import', async (req, res, next) => {
-  try { res.json(await fetchAndUpsertOrders(req.body || {})); }
-  catch (e) { next(e); }
+// Actions
+r.post("/import", async (req, res, next) => {
+  try {
+    res.json(await fetchAndUpsertOrders(req.body || {}));
+  } catch (e) {
+    next(e);
+  }
 });
 
-r.post('/allocate', async (_req, res, next) => {
-  try { const { applied, rows } = await runAllocationAndRead(); res.json({ applied, suggestions: rows }); }
-  catch (e) { next(e); }
+r.post("/allocate", async (_req, res, next) => {
+  try {
+    const { applied, rows } = await runAllocationAndRead();
+    res.json({ applied, suggestions: rows });
+  } catch (e) {
+    next(e);
+  }
 });
 
-r.post('/push', async (_req, res, next) => {
-  try { res.json(await pushAllocations()); }
-  catch (e) { next(e); }
+r.post("/push", async (_req, res, next) => {
+  try {
+    res.json(await pushAllocations());
+  } catch (e) {
+    next(e);
+  }
 });
 
 export default r;
