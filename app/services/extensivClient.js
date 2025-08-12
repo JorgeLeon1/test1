@@ -18,8 +18,8 @@ function pickList(data) {
 let tokenCache = { token: null, exp: 0 };
 
 /**
- * Bearer token fetch (only used if EXT_AUTH_MODE=bearer).
- * Uses the exact Postman flow you confirmed:
+ * Bearer token fetch (used only if EXT_AUTH_MODE=bearer).
+ * Uses the same flow you confirmed in Postman:
  *   POST https://box.secure-wms.com/oauth/token
  *   Authorization: Basic <base64(clientId:clientSecret)>
  *   Body (x-www-form-urlencoded): grant_type=client_credentials, user_login or user_login_id
@@ -45,7 +45,7 @@ export async function getAccessToken() {
       ? { user_login_id: String(process.env.EXT_USER_LOGIN_ID) }
       : { user_login: String(process.env.EXT_USER_LOGIN || "") })
   });
-  // Optional, only if tenant requires:
+  // Optional: only if tenant requires it
   if (process.env.EXT_TPL_GUID) form.append("tplguid", String(process.env.EXT_TPL_GUID));
   if (process.env.EXT_TPL) form.append("tpl", String(process.env.EXT_TPL));
 
@@ -89,16 +89,16 @@ export async function authHeaders() {
   // Scoping headers (set these in Render if your tenant requires them)
   if (process.env.EXT_CUSTOMER_IDS) {
     h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS;
-    h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS; // alternate casing
+    h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS; // alt casing
   }
   if (process.env.EXT_FACILITY_IDS) {
     h["FacilityIds"] = process.env.EXT_FACILITY_IDS;
     h["FacilityIDs"] = process.env.EXT_FACILITY_IDS;
   }
   if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
-  if (process.env.EXT_CUSTOMER_ID) h["3PL-Customer-Id"] = process.env.EXT_CUSTOMER_ID;
-  if (process.env.EXT_USER_LOGIN) h["User-Login"] = process.env.EXT_USER_LOGIN;
-  if (process.env.EXT_USER_LOGIN_ID) h["User-Login-Id"] = process.env.EXT_USER_LOGIN_ID;
+  if (process.env.EXT_CUSTOMER_ID)  h["3PL-Customer-Id"]  = process.env.EXT_CUSTOMER_ID;
+  if (process.env.EXT_USER_LOGIN)   h["User-Login"]       = process.env.EXT_USER_LOGIN;
+  if (process.env.EXT_USER_LOGIN_ID) h["User-Login-Id"]   = process.env.EXT_USER_LOGIN_ID;
 
   return h;
 }
@@ -108,10 +108,11 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const pool = await getPool();
 
+  // 🔧 PATCH: prefer legacy path first on your tenant
   const endpoints = [
-    `${base}/api/v1/orders`, // modern
-    `${base}/orders`,        // legacy
-    `${base}/api/orders`     // alt
+    `${base}/orders`,         // legacy (works on box for many tenants)
+    `${base}/api/v1/orders`,  // modern
+    `${base}/api/orders`      // alt
   ];
 
   let page = 1;
@@ -124,13 +125,22 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
 
     for (const url of endpoints) {
       try {
+        // 🔧 PATCH: include scoping as QUERY PARAMS too
         const r = await axios.get(url, {
           headers,
           params: {
             page,
             pageSize,
+            // filters
             ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
-            ...(status ? { status } : {})
+            ...(status ? { status } : {}),
+            // scoping as query params (both common casings)
+            ...(process.env.EXT_CUSTOMER_IDS
+              ? { customerIds: process.env.EXT_CUSTOMER_IDS, customerIDs: process.env.EXT_CUSTOMER_IDS }
+              : {}),
+            ...(process.env.EXT_FACILITY_IDS
+              ? { facilityIds: process.env.EXT_FACILITY_IDS, facilityIDs: process.env.EXT_FACILITY_IDS }
+              : {})
           },
           timeout: TIMEOUT
         });
@@ -140,7 +150,7 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
       } catch (e) {
         lastErr = e;
         const s = e.response?.status;
-        // Try the next candidate on typical auth/path issues; otherwise surface the error
+        // Try next candidate on typical auth/path issues; otherwise surface immediately
         if (![401, 403, 404].includes(s)) throw e;
       }
     }
