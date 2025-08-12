@@ -6,7 +6,7 @@ import { pushAllocations } from "../services/pushAllocations.js";
 
 const r = Router();
 
-r.get('/_debug', (req, res) => {
+r.get('/_debug', (_req, res) => {
   res.json({
     routeMounted: true,
     envPresent: {
@@ -22,6 +22,7 @@ r.get('/_debug', (req, res) => {
   });
 });
 
+// Token probe (lets us confirm OAuth succeeded)
 r.get('/token', async (_req, res) => {
   try {
     const h = await authHeaders();
@@ -32,19 +33,21 @@ r.get('/token', async (_req, res) => {
   }
 });
 
+// Try common header/path combos to see what your tenant wants
 r.get('/ping2', async (_req, res) => {
   const base = (process.env.EXT_BASE_URL || '').replace(/\/+$/, '');
   const h0 = await authHeaders();
   const combos = [
-    { path: '/orders',     label: 'Customer/Facility (ALL)',
+    { path: '/api/v1/orders', label: 'v1 + Customer/Facility',
       hdrs: h => ({ ...h, CustomerIds: process.env.EXT_CUSTOMER_IDS || 'ALL', FacilityIds: process.env.EXT_FACILITY_IDS || 'ALL' }) },
-    { path: '/api/orders', label: 'Customer/Facility (ALL) + /api',
+    { path: '/orders',        label: 'legacy + Customer/Facility',
       hdrs: h => ({ ...h, CustomerIds: process.env.EXT_CUSTOMER_IDS || 'ALL', FacilityIds: process.env.EXT_FACILITY_IDS || 'ALL' }) },
-    { path: '/orders',     label: '3PL-Warehouse/Customer',
+    { path: '/api/v1/orders', label: 'v1 + 3PL Warehouse/Customer',
       hdrs: h => ({ ...h, '3PL-Warehouse-Id': process.env.EXT_WAREHOUSE_ID || '', '3PL-Customer-Id': process.env.EXT_CUSTOMER_ID || '' }) },
-    { path: '/api/orders', label: '3PL-Warehouse/Customer + /api',
+    { path: '/orders',        label: 'legacy + 3PL Warehouse/Customer',
       hdrs: h => ({ ...h, '3PL-Warehouse-Id': process.env.EXT_WAREHOUSE_ID || '', '3PL-Customer-Id': process.env.EXT_CUSTOMER_ID || '' }) },
   ];
+
   const results = [];
   for (const c of combos) {
     const url = base + c.path;
@@ -58,9 +61,20 @@ r.get('/ping2', async (_req, res) => {
   res.status(500).json({ ok:false, tried: results });
 });
 
-// existing endpoints
-r.post('/import', async (req, res, next) => { try { res.json(await fetchAndUpsertOrders(req.body || {})); } catch (e) { next(e); }});
-r.post('/allocate', async (_req, res, next) => { try { const { applied, rows } = await runAllocationAndRead(); res.json({ applied, suggestions: rows }); } catch (e) { next(e); }});
-r.post('/push', async (_req, res, next) => { try { res.json(await pushAllocations()); } catch (e) { next(e); }});
+// Your action endpoints
+r.post('/import', async (req, res, next) => {
+  try { res.json(await fetchAndUpsertOrders(req.body || {})); }
+  catch (e) { next(e); }
+});
+
+r.post('/allocate', async (_req, res, next) => {
+  try { const { applied, rows } = await runAllocationAndRead(); res.json({ applied, suggestions: rows }); }
+  catch (e) { next(e); }
+});
+
+r.post('/push', async (_req, res, next) => {
+  try { res.json(await pushAllocations()); }
+  catch (e) { next(e); }
+});
 
 export default r;
