@@ -1,52 +1,41 @@
-// app/services/extensivClient.js
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
 const TIMEOUT = 20000;
 
-// ---------------- helpers ----------------
+// helpers
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const nowMs = () => Date.now();
-function pickList(data) {
-  if (Array.isArray(data?.data)) return data.data;
-  if (Array.isArray(data)) return data;
-  return [];
-}
+const listify = (data) => (Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []));
 
-// --------------- AUTH: BASIC or BEARER ---------------
+// ---------------- AUTH (Basic or Bearer) ----------------
 let tokenCache = { token: null, exp: 0, winner: null };
 
-/**
- * Bearer token fetch (only used if EXT_AUTH_MODE=bearer).
- * Tries box oauth/form, secure-wms oauth/form, and AuthServer JSON
- * with both user_login vs user_login_id and tplguid vs tpl. Caches winner.
- */
 export async function getAccessToken() {
   if (tokenCache.token && nowMs() < tokenCache.exp - 60_000) return tokenCache.token;
 
-  const basicB64 =
+  const b64 =
     process.env.EXT_BASIC_AUTH_B64 ||
     (process.env.EXT_CLIENT_ID && process.env.EXT_CLIENT_SECRET
       ? Buffer.from(`${process.env.EXT_CLIENT_ID}:${process.env.EXT_CLIENT_SECRET}`).toString("base64")
       : null);
-  if (!basicB64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
 
-  const userLogin    = process.env.EXT_USER_LOGIN || "";
-  const userLoginId  = process.env.EXT_USER_LOGIN_ID;
-  const tplguid      = process.env.EXT_TPL_GUID;
-  const tpl          = process.env.EXT_TPL || process.env.EXT_TPL_ID;
+  if (!b64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
 
-  // Build endpoint candidates (EXT_TOKEN_URL override first if present)
+  const userLogin   = process.env.EXT_USER_LOGIN || "";
+  const userLoginId = process.env.EXT_USER_LOGIN_ID;
+  const tplguid     = process.env.EXT_TPL_GUID;
+  const tpl         = process.env.EXT_TPL || process.env.EXT_TPL_ID;
+
   const endpoints = [];
   if (process.env.EXT_TOKEN_URL) endpoints.push({ url: trimBase(process.env.EXT_TOKEN_URL), style: "form" });
   endpoints.push(
     { url: "https://box.secure-wms.com/oauth/token", style: "form" },
     { url: "https://secure-wms.com/oauth/token",     style: "form" },
     { url: "https://secure-wms.com/AuthServer/api/Token", style: "json" },
-    { url: "https://box.secure-wms.com/AuthServer/api/Token", style: "json" }, // some tenants mirror here
+    { url: "https://box.secure-wms.com/AuthServer/api/Token", style: "json" }
   );
 
-  // Try field variants
   const userKeys = userLoginId ? [["user_login_id", String(userLoginId)], ["user_login", String(userLogin)]] 
                                : [["user_login", String(userLogin)]];
   const tplKeys  = tplguid ? [["tplguid", String(tplguid)], ...(tpl ? [["tpl", String(tpl)]] : [])]
@@ -71,7 +60,7 @@ export async function getAccessToken() {
           }
 
           const r = await axios.post(ep.url, data, {
-            headers: { ...headers, Accept: "application/json", Authorization: `Basic ${basicB64}` },
+            headers: { ...headers, Accept: "application/json", Authorization: `Basic ${b64}` },
             timeout: TIMEOUT,
           });
           const { access_token, expires_in = 1800 } = r.data || {};
@@ -80,11 +69,7 @@ export async function getAccessToken() {
           if (process.env.LOG_TOKEN_DEBUG === "true") console.log("[OAuth winner]", tokenCache.winner);
           return access_token;
         } catch (e) {
-          attempts.push({
-            url: ep.url, style: ep.style, uKey, tKey,
-            status: e.response?.status || null,
-            data: e.response?.data || String(e.message),
-          });
+          attempts.push({ url: ep.url, style: ep.style, uKey, tKey, status: e.response?.status || null, data: e.response?.data || String(e.message) });
         }
       }
     }
@@ -92,11 +77,6 @@ export async function getAccessToken() {
   throw new Error("All token endpoints failed: " + JSON.stringify(attempts.slice(0, 6), null, 2));
 }
 
-/**
- * Build headers depending on mode.
- * BASIC (default): Authorization: Basic <base64>
- * BEARER: Authorization: Bearer <token>
- */
 export async function authHeaders() {
   const mode = (process.env.EXT_AUTH_MODE || "basic").toLowerCase();
   const h = { Accept: "application/json", "Content-Type": "application/json" };
@@ -111,10 +91,10 @@ export async function authHeaders() {
     h.Authorization = `Basic ${b64}`;
   }
 
-  // Scoping headers (set in Render env)
+  // Scoping via headers (legacy /orders prefers headers over query params)
   if (process.env.EXT_CUSTOMER_IDS) {
     h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS;
-    h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS; // alt casing
+    h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS; // alternate casing
   }
   if (process.env.EXT_FACILITY_IDS) {
     h["FacilityIds"] = process.env.EXT_FACILITY_IDS;
@@ -128,16 +108,16 @@ export async function authHeaders() {
   return h;
 }
 
-// --------------- ORDERS -> SQL upsert ---------------
+// ---------------- Fetch orders and upsert to SQL ----------------
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
-  const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com").replace(/\/+$/, "");
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const pool = await getPool();
 
-  // Prefer legacy first for your tenant
+  // Try legacy first; if that fails, try v1/api
   const endpoints = [
-    `${base}/orders`,         // legacy (works on box, but NO page/pagesize)
-    `${base}/api/v1/orders`,  // 404 on your tenant per ping2
-    `${base}/api/orders`,     // alt (keep as fallback)
+    `${base}/orders`,         // legacy — NO query params
+    `${base}/api/v1/orders`,  // fallback
+    `${base}/api/orders`,     // alt fallback
   ];
 
   let page = 1;
@@ -151,32 +131,28 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
     for (const url of endpoints) {
       const isLegacy = url.endsWith("/orders");
 
-      // Build params: DO NOT send page/pageSize to legacy
-      const params = {
-        ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
-        ...(status ? { status } : {}),
-        ...(process.env.EXT_CUSTOMER_IDS
-          ? { customerIds: process.env.EXT_CUSTOMER_IDS, customerIDs: process.env.EXT_CUSTOMER_IDS }
-          : {}),
-        ...(process.env.EXT_FACILITY_IDS
-          ? { facilityIds: process.env.EXT_FACILITY_IDS, facilityIDs: process.env.EXT_FACILITY_IDS }
-          : {}),
-        // Only non-legacy endpoints get pagination
-        ...(!isLegacy ? { page, pageSize } : {}),
-      };
-
       try {
-        const r = await axios.get(url, { headers, params, timeout: 20000 });
-        const d = r.data;
-        list = Array.isArray(d?.data) ? d.data : (Array.isArray(d) ? d : []);
+        const resp = await axios.get(url, {
+          headers,
+          // Only send params for non-legacy endpoints
+          ...(isLegacy ? {} : {
+            params: {
+              page,
+              pageSize,
+              ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
+              ...(status ? { status } : {}),
+            }
+          }),
+          timeout: TIMEOUT,
+        });
+
+        list = listify(resp.data);
         lastErr = null;
-        break;
+        break; // stop at first endpoint that responds
       } catch (e) {
         lastErr = e;
         const s = e.response?.status;
-        // Try other candidate endpoints only on typical auth/path errors
-        if (![400, 401, 403, 404].includes(s)) throw e;
-        // Note: 400 here likely means param mismatch; we’ll fall through to try next endpoint
+        if (![400, 401, 403, 404].includes(s)) throw e; // only fall through on common path/auth errors
       }
     }
 
@@ -186,7 +162,7 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
     }
     if (!list.length) break;
 
-    // Upsert each item into SQL
+    // Upsert items -> SQL
     const tx = new sql.Transaction(pool);
     await tx.begin();
     try {
@@ -218,14 +194,8 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
       throw e;
     }
 
-    // If we used the legacy endpoint, there is no paging—stop after first page
-    // (If your tenant later supports paging via different names, we can add that.)
-    if (true) break;
-
-    // Otherwise continue paging for v1 endpoints
-    imported += list.length;
-    if (list.length < pageSize) break;
-    page++;
+    // Legacy has no supported paging → stop after first batch
+    break;
   }
 
   return { imported };
