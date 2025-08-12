@@ -14,76 +14,82 @@ function pickList(data) {
 }
 
 // --------------- AUTH: BASIC or BEARER ---------------
-let tokenCache = { token: null, exp: 0 };
+let tokenCache = { token: null, exp: 0, winner: null };
 
 /**
  * Bearer token fetch (only used if EXT_AUTH_MODE=bearer).
- * Tries common Extensiv token endpoints until one succeeds, then caches.
+ * Tries box oauth/form, secure-wms oauth/form, and AuthServer JSON
+ * with both user_login vs user_login_id and tplguid vs tpl. Caches winner.
  */
 export async function getAccessToken() {
   if (tokenCache.token && nowMs() < tokenCache.exp - 60_000) return tokenCache.token;
 
-  const b64 =
+  const basicB64 =
     process.env.EXT_BASIC_AUTH_B64 ||
     (process.env.EXT_CLIENT_ID && process.env.EXT_CLIENT_SECRET
       ? Buffer.from(`${process.env.EXT_CLIENT_ID}:${process.env.EXT_CLIENT_SECRET}`).toString("base64")
       : null);
-  if (!b64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
+  if (!basicB64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
 
-  const userLogin   = process.env.EXT_USER_LOGIN || "";
-  const userLoginId = process.env.EXT_USER_LOGIN_ID;
-  const tplguid     = process.env.EXT_TPL_GUID;
-  const tpl         = process.env.EXT_TPL || process.env.EXT_TPL_ID;
+  const userLogin    = process.env.EXT_USER_LOGIN || "";
+  const userLoginId  = process.env.EXT_USER_LOGIN_ID;
+  const tplguid      = process.env.EXT_TPL_GUID;
+  const tpl          = process.env.EXT_TPL || process.env.EXT_TPL_ID;
 
-  // Prefer explicit override if provided
+  // Build endpoint candidates (EXT_TOKEN_URL override first if present)
   const endpoints = [];
-  if (process.env.EXT_TOKEN_URL) endpoints.push({ url: process.env.EXT_TOKEN_URL, style: "form" });
-  // Common sandbox/tenant endpoints
+  if (process.env.EXT_TOKEN_URL) endpoints.push({ url: trimBase(process.env.EXT_TOKEN_URL), style: "form" });
   endpoints.push(
     { url: "https://box.secure-wms.com/oauth/token", style: "form" },
     { url: "https://secure-wms.com/oauth/token",     style: "form" },
     { url: "https://secure-wms.com/AuthServer/api/Token", style: "json" },
+    { url: "https://box.secure-wms.com/AuthServer/api/Token", style: "json" }, // some tenants mirror here
   );
 
-  const attempts = [];
-  for (const { url, style } of endpoints) {
-    try {
-      let data, headers;
-      if (style === "form") {
-        const form = new URLSearchParams({
-          grant_type: "client_credentials",
-          ...(userLoginId ? { user_login_id: String(userLoginId) } : { user_login: String(userLogin) }),
-        });
-        if (tplguid) form.append("tplguid", String(tplguid));
-        if (tpl)     form.append("tpl", String(tpl));
-        data = form;
-        headers = { "Content-Type": "application/x-www-form-urlencoded" };
-      } else {
-        data = {
-          grant_type: "client_credentials",
-          ...(userLoginId ? { user_login_id: String(userLoginId) } : { user_login: String(userLogin) }),
-          ...(tplguid ? { tplguid: String(tplguid) } : (tpl ? { tpl: String(tpl) } : {})),
-        };
-        headers = { "Content-Type": "application/json" };
-      }
+  // Try field variants
+  const userKeys = userLoginId ? [["user_login_id", String(userLoginId)], ["user_login", String(userLogin)]] 
+                               : [["user_login", String(userLogin)]];
+  const tplKeys  = tplguid ? [["tplguid", String(tplguid)], ...(tpl ? [["tpl", String(tpl)]] : [])]
+                           : (tpl ? [["tpl", String(tpl)]] : [["tpl", ""]]);
 
-      const r = await axios.post(url, data, {
-        headers: { ...headers, Accept: "application/json", Authorization: `Basic ${b64}` },
-        timeout: TIMEOUT,
-      });
-      const { access_token, expires_in = 1800 } = r.data || {};
-      if (!access_token) throw new Error(`No access_token from ${url}`);
-      tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000 };
-      if (process.env.LOG_TOKEN_DEBUG === "true") {
-        console.log("[OAuth winner]", { url, style, len: access_token.length });
+  const attempts = [];
+  for (const ep of endpoints) {
+    for (const [uKey, uVal] of userKeys) {
+      for (const [tKey, tVal] of tplKeys) {
+        try {
+          let data, headers;
+          if (ep.style === "form") {
+            const form = new URLSearchParams({ grant_type: "client_credentials", [uKey]: uVal });
+            if (tVal) form.append(tKey, tVal);
+            data = form;
+            headers = { "Content-Type": "application/x-www-form-urlencoded" };
+          } else {
+            const body = { grant_type: "client_credentials", [uKey]: uVal };
+            if (tVal) body[tKey] = tVal;
+            data = body;
+            headers = { "Content-Type": "application/json" };
+          }
+
+          const r = await axios.post(ep.url, data, {
+            headers: { ...headers, Accept: "application/json", Authorization: `Basic ${basicB64}` },
+            timeout: TIMEOUT,
+          });
+          const { access_token, expires_in = 1800 } = r.data || {};
+          if (!access_token) throw new Error(`No access_token from ${ep.url}`);
+          tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000, winner: { ...ep, uKey, tKey } };
+          if (process.env.LOG_TOKEN_DEBUG === "true") console.log("[OAuth winner]", tokenCache.winner);
+          return access_token;
+        } catch (e) {
+          attempts.push({
+            url: ep.url, style: ep.style, uKey, tKey,
+            status: e.response?.status || null,
+            data: e.response?.data || String(e.message),
+          });
+        }
       }
-      return access_token;
-    } catch (e) {
-      attempts.push({ url, style, status: e.response?.status || null, data: e.response?.data || String(e.message) });
     }
   }
-
-  throw new Error("All token endpoints failed: " + JSON.stringify(attempts.slice(0, 3), null, 2));
+  throw new Error("All token endpoints failed: " + JSON.stringify(attempts.slice(0, 6), null, 2));
 }
 
 /**
