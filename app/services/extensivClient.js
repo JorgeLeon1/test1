@@ -1,8 +1,14 @@
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-// Simple in-memory token cache
+// ---- Token cache (memory) ----
 let tokenCache = { access_token: null, exp: 0 };
+
+function baseUrl() {
+  const b = (process.env.EXT_BASE_URL || "").replace(/\/+$/, "");
+  if (!b) throw new Error("Missing EXT_BASE_URL");
+  return b;
+}
 
 async function getAccessToken() {
   const now = Date.now();
@@ -10,81 +16,113 @@ async function getAccessToken() {
     return tokenCache.access_token;
   }
 
-  const id = process.env.EXT_CLIENT_ID;
-  const secret = process.env.EXT_CLIENT_SECRET;
-  if (!id || !secret) throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET");
+  const clientId = process.env.EXT_CLIENT_ID;
+  const clientSecret = process.env.EXT_CLIENT_SECRET;
+  const userLogin = process.env.EXT_USER_LOGIN;
+  const tplguid   = process.env.EXT_TPL_GUID;
 
-  const basic = Buffer.from(`${id}:${secret}`).toString("base64");
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET");
+  }
+  if (!userLogin || !tplguid) {
+    throw new Error("Missing EXT_USER_LOGIN / EXT_TPL_GUID");
+  }
 
-  // Box (secure-wms) sandbox expects these params for OAuth
-  const params = new URLSearchParams({
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const form = new URLSearchParams({
     grant_type: "client_credentials",
-    user_login: process.env.EXT_USER_LOGIN || "",
-    tplguid: process.env.EXT_TPL_GUID || ""
+    user_login: userLogin,
+    tplguid: tplguid
   });
-  if (process.env.EXT_USER_LOGIN_ID) params.append("user_login_id", process.env.EXT_USER_LOGIN_ID);
+  if (process.env.EXT_USER_LOGIN_ID) {
+    form.append("user_login_id", process.env.EXT_USER_LOGIN_ID);
+  }
 
-  const resp = await axios.post(
-    `${process.env.EXT_BASE_URL.replace(/\/+$/, "")}/oauth/token`,
-    params,
-    { headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" } }
-  );
-
-  const { access_token, expires_in = 3600 } = resp.data || {};
-  if (!access_token) throw new Error("No access_token in OAuth response");
-  tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
-  return access_token;
+  try {
+    const resp = await axios.post(
+      `${baseUrl()}/api/v1/oauth/token`,
+      form,
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Authorization": `Basic ${basic}` // <-- Basic for token exchange
+        },
+        timeout: 20000
+      }
+    );
+    const { access_token, expires_in = 3600 } = resp.data || {};
+    if (!access_token) throw new Error("No access_token in OAuth response");
+    tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
+    return access_token;
+  } catch (e) {
+    console.error("[OAuth token error]",
+      e.response?.status,
+      e.response?.data || e.message
+    );
+    throw e;
+  }
 }
 
-// 👉 Exported: used by routes (token probe, ping2, actual calls)
+// Exported: used by routes & diagnostics
 export async function authHeaders() {
   const bearer = await getAccessToken();
   const h = {
-    Authorization: `Bearer ${bearer}`,
+    Authorization: `Bearer ${bearer}`, // <-- Bearer for resource calls
     Accept: "application/json",
     "Content-Type": "application/json",
   };
-  // Tenant-scoping headers commonly required in Box sandbox
-  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // e.g. "ALL" or "123,456"
-  if (process.env.EXT_FACILITY_IDS) h["FacilityIds"] = process.env.EXT_FACILITY_IDS; // e.g. "ALL" or "10,20"
+  // Common sandbox scoping
+  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // "ALL" or "1,2,3"
+  if (process.env.EXT_FACILITY_IDS) h["FacilityIds"] = process.env.EXT_FACILITY_IDS; // "ALL" or "10,20"
+  // Some tenants still require 3PL headers
   if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
   if (process.env.EXT_CUSTOMER_ID)  h["3PL-Customer-Id"]  = process.env.EXT_CUSTOMER_ID;
   return h;
 }
 
-// 👉 Exported: used by /extensiv/import
+// Exported: your import action
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
-  const base = process.env.EXT_BASE_URL.replace(/\/+$/, "");
   const pool = await getPool();
-
+  const base = baseUrl();
   let page = 1;
   let imported = 0;
 
   while (true) {
+    // ----- call orders API (v1 path on box) -----
     let list = [];
     try {
       const headers = await authHeaders();
-      // Try the v1 path first (common in box.secure-wms)
       const resp = await axios.get(`${base}/api/v1/orders`, {
         headers,
-        params: { modifiedDateStart: modifiedSince, status, page, pageSize }
+        params: {
+          page,
+          pageSize,
+          // optional filters — include only if provided
+          ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
+          ...(status ? { status } : {})
+        },
+        timeout: 20000
       });
       const data = resp.data;
       list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
     } catch (err) {
-      // Bubble up with details so the global error handler logs it
-      console.error("[Extensiv import] HTTP error", err.response?.status, err.response?.data || err.message);
+      console.error("[Extensiv /orders error]",
+        err.response?.status,
+        err.response?.data || err.message
+      );
       throw err;
     }
 
     if (!list.length) break;
 
+    // ----- upsert into SQL -----
     const tx = new sql.Transaction(pool);
     await tx.begin();
     try {
       const req = new sql.Request(tx);
       for (const o of list) {
-        for (const it of (o.items || [])) {
+        const items = Array.isArray(o.items) ? o.items : [];
+        for (const it of items) {
           await req
             .input("OrderItemID", sql.Int, it.id ?? it.orderItemId ?? null)
             .input("ItemID", sql.VarChar(100), it.sku ?? "")
