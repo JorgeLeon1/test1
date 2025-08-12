@@ -7,7 +7,6 @@ const TIMEOUT = 20000;
 // ---------------- helpers ----------------
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const nowMs = () => Date.now();
-
 function pickList(data) {
   if (Array.isArray(data?.data)) return data.data;
   if (Array.isArray(data)) return data;
@@ -18,50 +17,73 @@ function pickList(data) {
 let tokenCache = { token: null, exp: 0 };
 
 /**
- * Bearer token fetch (used only if EXT_AUTH_MODE=bearer).
- * Uses the same flow you confirmed in Postman:
- *   POST https://box.secure-wms.com/oauth/token
- *   Authorization: Basic <base64(clientId:clientSecret)>
- *   Body (x-www-form-urlencoded): grant_type=client_credentials, user_login or user_login_id
+ * Bearer token fetch (only used if EXT_AUTH_MODE=bearer).
+ * Tries common Extensiv token endpoints until one succeeds, then caches.
  */
 export async function getAccessToken() {
-  const fresh = tokenCache.token && nowMs() < tokenCache.exp - 60_000;
-  if (fresh) return tokenCache.token;
+  if (tokenCache.token && nowMs() < tokenCache.exp - 60_000) return tokenCache.token;
 
   const b64 =
     process.env.EXT_BASIC_AUTH_B64 ||
     (process.env.EXT_CLIENT_ID && process.env.EXT_CLIENT_SECRET
       ? Buffer.from(`${process.env.EXT_CLIENT_ID}:${process.env.EXT_CLIENT_SECRET}`).toString("base64")
       : null);
+  if (!b64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
 
-  if (!b64) {
-    throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
+  const userLogin   = process.env.EXT_USER_LOGIN || "";
+  const userLoginId = process.env.EXT_USER_LOGIN_ID;
+  const tplguid     = process.env.EXT_TPL_GUID;
+  const tpl         = process.env.EXT_TPL || process.env.EXT_TPL_ID;
+
+  // Prefer explicit override if provided
+  const endpoints = [];
+  if (process.env.EXT_TOKEN_URL) endpoints.push({ url: process.env.EXT_TOKEN_URL, style: "form" });
+  // Common sandbox/tenant endpoints
+  endpoints.push(
+    { url: "https://box.secure-wms.com/oauth/token", style: "form" },
+    { url: "https://secure-wms.com/oauth/token",     style: "form" },
+    { url: "https://secure-wms.com/AuthServer/api/Token", style: "json" },
+  );
+
+  const attempts = [];
+  for (const { url, style } of endpoints) {
+    try {
+      let data, headers;
+      if (style === "form") {
+        const form = new URLSearchParams({
+          grant_type: "client_credentials",
+          ...(userLoginId ? { user_login_id: String(userLoginId) } : { user_login: String(userLogin) }),
+        });
+        if (tplguid) form.append("tplguid", String(tplguid));
+        if (tpl)     form.append("tpl", String(tpl));
+        data = form;
+        headers = { "Content-Type": "application/x-www-form-urlencoded" };
+      } else {
+        data = {
+          grant_type: "client_credentials",
+          ...(userLoginId ? { user_login_id: String(userLoginId) } : { user_login: String(userLogin) }),
+          ...(tplguid ? { tplguid: String(tplguid) } : (tpl ? { tpl: String(tpl) } : {})),
+        };
+        headers = { "Content-Type": "application/json" };
+      }
+
+      const r = await axios.post(url, data, {
+        headers: { ...headers, Accept: "application/json", Authorization: `Basic ${b64}` },
+        timeout: TIMEOUT,
+      });
+      const { access_token, expires_in = 1800 } = r.data || {};
+      if (!access_token) throw new Error(`No access_token from ${url}`);
+      tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000 };
+      if (process.env.LOG_TOKEN_DEBUG === "true") {
+        console.log("[OAuth winner]", { url, style, len: access_token.length });
+      }
+      return access_token;
+    } catch (e) {
+      attempts.push({ url, style, status: e.response?.status || null, data: e.response?.data || String(e.message) });
+    }
   }
 
-  const tokenUrl = trimBase(process.env.EXT_TOKEN_URL) || "https://box.secure-wms.com/oauth/token";
-  const form = new URLSearchParams({
-    grant_type: "client_credentials",
-    ...(process.env.EXT_USER_LOGIN_ID
-      ? { user_login_id: String(process.env.EXT_USER_LOGIN_ID) }
-      : { user_login: String(process.env.EXT_USER_LOGIN || "") })
-  });
-  // Optional: only if tenant requires it
-  if (process.env.EXT_TPL_GUID) form.append("tplguid", String(process.env.EXT_TPL_GUID));
-  if (process.env.EXT_TPL) form.append("tpl", String(process.env.EXT_TPL));
-
-  const r = await axios.post(tokenUrl, form, {
-    headers: {
-      Authorization: `Basic ${b64}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json"
-    },
-    timeout: TIMEOUT
-  });
-
-  const { access_token, expires_in = 1800 } = r.data || {};
-  if (!access_token) throw new Error("No access_token in token response");
-  tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000 };
-  return access_token;
+  throw new Error("All token endpoints failed: " + JSON.stringify(attempts.slice(0, 3), null, 2));
 }
 
 /**
@@ -71,10 +93,7 @@ export async function getAccessToken() {
  */
 export async function authHeaders() {
   const mode = (process.env.EXT_AUTH_MODE || "basic").toLowerCase();
-  const h = {
-    Accept: "application/json",
-    "Content-Type": "application/json"
-  };
+  const h = { Accept: "application/json", "Content-Type": "application/json" };
 
   if (mode === "bearer") {
     const token = await getAccessToken();
@@ -86,7 +105,7 @@ export async function authHeaders() {
     h.Authorization = `Basic ${b64}`;
   }
 
-  // Scoping headers (set these in Render if your tenant requires them)
+  // Scoping headers (set in Render env)
   if (process.env.EXT_CUSTOMER_IDS) {
     h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS;
     h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS; // alt casing
@@ -98,7 +117,7 @@ export async function authHeaders() {
   if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
   if (process.env.EXT_CUSTOMER_ID)  h["3PL-Customer-Id"]  = process.env.EXT_CUSTOMER_ID;
   if (process.env.EXT_USER_LOGIN)   h["User-Login"]       = process.env.EXT_USER_LOGIN;
-  if (process.env.EXT_USER_LOGIN_ID) h["User-Login-Id"]   = process.env.EXT_USER_LOGIN_ID;
+  if (process.env.EXT_USER_LOGIN_ID)h["User-Login-Id"]    = process.env.EXT_USER_LOGIN_ID;
 
   return h;
 }
@@ -108,11 +127,11 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const pool = await getPool();
 
-  // 🔧 PATCH: prefer legacy path first on your tenant
+  // Prefer legacy path first on many box tenants, then fallbacks
   const endpoints = [
-    `${base}/orders`,         // legacy (works on box for many tenants)
-    `${base}/api/v1/orders`,  // modern
-    `${base}/api/orders`      // alt
+    `${base}/orders`,
+    `${base}/api/v1/orders`,
+    `${base}/api/orders`,
   ];
 
   let page = 1;
@@ -125,7 +144,6 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
 
     for (const url of endpoints) {
       try {
-        // 🔧 PATCH: include scoping as QUERY PARAMS too
         const r = await axios.get(url, {
           headers,
           params: {
@@ -134,24 +152,23 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
             // filters
             ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
             ...(status ? { status } : {}),
-            // scoping as query params (both common casings)
+            // scoping as query params (cover common casings)
             ...(process.env.EXT_CUSTOMER_IDS
               ? { customerIds: process.env.EXT_CUSTOMER_IDS, customerIDs: process.env.EXT_CUSTOMER_IDS }
               : {}),
             ...(process.env.EXT_FACILITY_IDS
               ? { facilityIds: process.env.EXT_FACILITY_IDS, facilityIDs: process.env.EXT_FACILITY_IDS }
-              : {})
+              : {}),
           },
-          timeout: TIMEOUT
+          timeout: TIMEOUT,
         });
         list = pickList(r.data);
         lastErr = null;
-        break; // got a valid response from this endpoint
+        break; // success on this endpoint
       } catch (e) {
         lastErr = e;
         const s = e.response?.status;
-        // Try next candidate on typical auth/path issues; otherwise surface immediately
-        if (![401, 403, 404].includes(s)) throw e;
+        if (![401, 403, 404].includes(s)) throw e; // only continue on typical auth/path issues
       }
     }
 
