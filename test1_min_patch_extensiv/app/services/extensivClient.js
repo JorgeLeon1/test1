@@ -1,52 +1,48 @@
-// app/services/extensivClient.js
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-// ---- OAuth token cache ----
 let tokenCache = { access_token: null, exp: 0 };
 
 async function getAccessToken() {
-  // reuse a valid token if not close to expiry
   const now = Date.now();
   if (tokenCache.access_token && now < tokenCache.exp - 60_000) return tokenCache.access_token;
 
-  // prefer client-credentials flow (most common on api.scoutsft.com)
-  // required envs: EXT_CLIENT_ID, EXT_CLIENT_SECRET
-  const cid = process.env.EXT_CLIENT_ID;
-  const csec = process.env.EXT_CLIENT_SECRET;
-  if (!cid || !csec) {
-    throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET for Extensiv OAuth.");
-  }
-  const basic = Buffer.from(`${cid}:${csec}`).toString("base64");
+  const id = process.env.EXT_CLIENT_ID;
+  const secret = process.env.EXT_CLIENT_SECRET;
+  if (!id || !secret) throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET");
 
-  try {
-    const resp = await axios.post(
-      `${process.env.EXT_BASE_URL}/oauth/token`,
-      new URLSearchParams({ grant_type: "client_credentials" }),
-      { headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" } }
-    );
-    const { access_token, expires_in = 3600 } = resp.data || {};
-    if (!access_token) throw new Error("No access_token in OAuth response");
-    tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
-    return access_token;
-  } catch (e) {
-    // show the real reason in logs
-    console.error("[Extensiv OAuth error]", e.response?.status, e.response?.data || e.message);
-    throw e;
-  }
+  const basic = Buffer.from(`${id}:${secret}`).toString("base64");
+
+  // Box (secure-wms) sandbox typically requires: grant_type + user_login (+ user_login_id) + tplguid
+  const params = new URLSearchParams({
+    grant_type: "client_credentials",
+    user_login: process.env.EXT_USER_LOGIN || "",
+    tplguid: process.env.EXT_TPL_GUID || ""
+  });
+  if (process.env.EXT_USER_LOGIN_ID) params.append("user_login_id", process.env.EXT_USER_LOGIN_ID);
+
+  const resp = await axios.post(
+    `${process.env.EXT_BASE_URL}/oauth/token`,
+    params,
+    { headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+
+  const { access_token, expires_in = 3600 } = resp.data || {};
+  if (!access_token) throw new Error("No access_token in OAuth response");
+  tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
+  return access_token;
 }
 
 export async function authHeaders() {
-  // Prefer Bearer token
   const bearer = await getAccessToken();
   const h = {
     Authorization: `Bearer ${bearer}`,
     Accept: "application/json",
     "Content-Type": "application/json",
   };
-  // Tenant-scoping headers (often required)
-  if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
-  if (process.env.EXT_CUSTOMER_ID) h["3PL-Customer-Id"] = process.env.EXT_CUSTOMER_ID;
+  // Many box endpoints expect these tenant scoping headers
+  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // e.g., ALL or comma-separated
+  if (process.env.EXT_FACILITY_IDS) h["FacilityIds"] = process.env.EXT_FACILITY_IDS; // e.g., ALL or comma-separated
   return h;
 }
 
@@ -55,7 +51,7 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
   const pool = await getPool();
 
   while (true) {
-    // ----- fetch a page from Extensiv -----
+    // ----- call orders API -----
     let list = [];
     try {
       const headers = await authHeaders();
