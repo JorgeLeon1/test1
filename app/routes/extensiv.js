@@ -41,58 +41,34 @@ r.get("/token", async (_req, res) => {
   }
 });
 
-// ---- FIXED: never send page/pageSize to legacy /orders ----
-r.get("/ping2", async (req, res) => {
+// Ping orders endpoint(s)
+// IMPORTANT: legacy /orders MUST NOT receive query params (it rejects them)
+r.get("/ping2", async (_req, res) => {
   const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com").replace(/\/+$/, "");
   const tried = [];
   try {
     const headers = await authHeaders();
 
-    const scopeQP = {};
-    if (process.env.EXT_CUSTOMER_IDS) {
-      scopeQP.customerIds = process.env.EXT_CUSTOMER_IDS;
-      scopeQP.customerIDs = process.env.EXT_CUSTOMER_IDS;
-    }
-    if (process.env.EXT_FACILITY_IDS) {
-      scopeQP.facilityIds = process.env.EXT_FACILITY_IDS;
-      scopeQP.facilityIDs = process.env.EXT_FACILITY_IDS;
-    }
-
-    const filterQP = {
-      ...(req.query.status ? { status: req.query.status } : {}),
-      ...(req.query.modifiedSince ? { modifiedDateStart: req.query.modifiedSince } : {}),
-    };
-
-    // 1) Legacy first — NO paging params
+    // 1) Legacy: /orders  (no query params at all)
     try {
       const url = `${base}/orders`;
-      const params = { ...scopeQP, ...filterQP };
-      const resp = await axios.get(url, { headers, params, timeout: 15000 });
+      const resp = await axios.get(url, { headers, timeout: 15000 });
       const data = resp.data;
-      const count = Array.isArray(data?.data) ? data.data.length : Array.isArray(data) ? data.length : null;
+      const count = Array.isArray(data?.data) ? data.data.length : (Array.isArray(data) ? data.length : null);
       return res.json({ ok: true, winner: url, status: resp.status, count });
     } catch (e) {
-      tried.push({
-        url: `${base}/orders`,
-        status: e.response?.status || null,
-        data: e.response?.data || String(e),
-      });
+      tried.push({ url: `${base}/orders`, status: e.response?.status || null, data: e.response?.data || String(e) });
     }
 
-    // 2) v1 next — WITH paging
+    // 2) v1: /api/v1/orders  (try without params too)
     try {
       const url = `${base}/api/v1/orders`;
-      const params = { ...scopeQP, ...filterQP, page: 1, pageSize: 50 };
-      const resp = await axios.get(url, { headers, params, timeout: 15000 });
+      const resp = await axios.get(url, { headers, timeout: 15000 });
       const data = resp.data;
-      const count = Array.isArray(data?.data) ? data.data.length : Array.isArray(data) ? data.length : null;
+      const count = Array.isArray(data?.data) ? data.data.length : (Array.isArray(data) ? data.length : null);
       return res.json({ ok: true, winner: url, status: resp.status, count });
     } catch (e) {
-      tried.push({
-        url: `${base}/api/v1/orders`,
-        status: e.response?.status || null,
-        data: e.response?.data || String(e),
-      });
+      tried.push({ url: `${base}/api/v1/orders`, status: e.response?.status || null, data: e.response?.data || String(e) });
     }
 
     return res.status(500).json({ ok: false, tried });
