@@ -130,14 +130,14 @@ export async function authHeaders() {
 
 // --------------- ORDERS -> SQL upsert ---------------
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
-  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com").replace(/\/+$/, "");
   const pool = await getPool();
 
-  // Prefer legacy path first on many box tenants, then fallbacks
+  // Prefer legacy first for your tenant
   const endpoints = [
-    `${base}/orders`,
-    `${base}/api/v1/orders`,
-    `${base}/api/orders`,
+    `${base}/orders`,         // legacy (works on box, but NO page/pagesize)
+    `${base}/api/v1/orders`,  // 404 on your tenant per ping2
+    `${base}/api/orders`,     // alt (keep as fallback)
   ];
 
   let page = 1;
@@ -149,32 +149,34 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
     const headers = await authHeaders();
 
     for (const url of endpoints) {
+      const isLegacy = url.endsWith("/orders");
+
+      // Build params: DO NOT send page/pageSize to legacy
+      const params = {
+        ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
+        ...(status ? { status } : {}),
+        ...(process.env.EXT_CUSTOMER_IDS
+          ? { customerIds: process.env.EXT_CUSTOMER_IDS, customerIDs: process.env.EXT_CUSTOMER_IDS }
+          : {}),
+        ...(process.env.EXT_FACILITY_IDS
+          ? { facilityIds: process.env.EXT_FACILITY_IDS, facilityIDs: process.env.EXT_FACILITY_IDS }
+          : {}),
+        // Only non-legacy endpoints get pagination
+        ...(!isLegacy ? { page, pageSize } : {}),
+      };
+
       try {
-        const r = await axios.get(url, {
-          headers,
-          params: {
-            page,
-            pageSize,
-            // filters
-            ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
-            ...(status ? { status } : {}),
-            // scoping as query params (cover common casings)
-            ...(process.env.EXT_CUSTOMER_IDS
-              ? { customerIds: process.env.EXT_CUSTOMER_IDS, customerIDs: process.env.EXT_CUSTOMER_IDS }
-              : {}),
-            ...(process.env.EXT_FACILITY_IDS
-              ? { facilityIds: process.env.EXT_FACILITY_IDS, facilityIDs: process.env.EXT_FACILITY_IDS }
-              : {}),
-          },
-          timeout: TIMEOUT,
-        });
-        list = pickList(r.data);
+        const r = await axios.get(url, { headers, params, timeout: 20000 });
+        const d = r.data;
+        list = Array.isArray(d?.data) ? d.data : (Array.isArray(d) ? d : []);
         lastErr = null;
-        break; // success on this endpoint
+        break;
       } catch (e) {
         lastErr = e;
         const s = e.response?.status;
-        if (![401, 403, 404].includes(s)) throw e; // only continue on typical auth/path issues
+        // Try other candidate endpoints only on typical auth/path errors
+        if (![400, 401, 403, 404].includes(s)) throw e;
+        // Note: 400 here likely means param mismatch; we’ll fall through to try next endpoint
       }
     }
 
@@ -184,7 +186,7 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
     }
     if (!list.length) break;
 
-    // Upsert items to SQL
+    // Upsert each item into SQL
     const tx = new sql.Transaction(pool);
     await tx.begin();
     try {
@@ -216,8 +218,13 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
       throw e;
     }
 
+    // If we used the legacy endpoint, there is no paging—stop after first page
+    // (If your tenant later supports paging via different names, we can add that.)
+    if (true) break;
+
+    // Otherwise continue paging for v1 endpoints
     imported += list.length;
-    if (list.length < pageSize) break; // last page
+    if (list.length < pageSize) break;
     page++;
   }
 
