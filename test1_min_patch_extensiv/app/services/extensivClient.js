@@ -1,6 +1,27 @@
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
+// token probe: returns token length + first/last chars (not the token itself)
+r.get('/token', async (req, res) => {
+  try {
+    const { authHeaders } = await import('../services/extensivClient.js');
+    const h = await authHeaders(); // forces token fetch inside
+    const bearer = h.Authorization?.split(' ')[1] || '';
+    res.json({
+      ok: true,
+      tokenLen: bearer.length,
+      tokenHead: bearer.slice(0, 12),
+      tokenTail: bearer.slice(-8),
+      usedBaseUrl: process.env.EXT_BASE_URL,
+      user_login: !!process.env.EXT_USER_LOGIN,
+      tplguid: !!process.env.EXT_TPL_GUID
+    });
+  } catch (e) {
+    console.error('[token probe]', e.response?.status, e.response?.data || e.message);
+    res.status(500).json({ ok:false, status:e.response?.status, data:e.response?.data || e.message });
+  }
+});
+
 let tokenCache = { access_token: null, exp: 0 };
 
 async function getAccessToken() {
