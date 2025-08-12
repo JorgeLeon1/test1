@@ -3,95 +3,56 @@ import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
 const TIMEOUT = 20000;
+const CONCURRENCY = Number(process.env.EXT_FETCH_DETAILS_CONCURRENCY || 5);
 
 // ---------- helpers ----------
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const nowMs = () => Date.now();
 
-/**
- * Convert a payload into a list of orders.
- * Handles many shapes, including your legacy shape with `ResourceList`.
- */
 const listify = (data) => {
   if (Array.isArray(data)) return data;
   const candidates = [
-    "ResourceList", // <== your tenant
-    "data",
-    "results", "Results",
-    "items", "Items",
-    "orders", "Orders",
-    "records", "Records",
-    "value", "Value",
-    "list", "List",
+    "ResourceList", // your legacy list key
+    "data","results","Results","items","Items","orders","Orders","records","Records","value","Value","list","List",
   ];
-  for (const k of candidates) {
-    if (Array.isArray(data?.[k])) return data[k];
-  }
+  for (const k of candidates) if (Array.isArray(data?.[k])) return data[k];
   if (data && typeof data === "object") {
-    for (const v of Object.values(data)) {
-      if (Array.isArray(v)) return v;
-    }
+    for (const v of Object.values(data)) if (Array.isArray(v)) return v;
   }
   return [];
 };
 
-/**
- * Try to locate line items within an order object across common shapes.
- * Returns an array (possibly empty).
- */
 function extractItems(order) {
   if (!order || typeof order !== "object") return [];
-  const candidates = [
-    order.items,
-    order.Items,
-    order.OrderLineItems,
-    order.Lines,
-    order.OrderDetails,
-    order.Details?.OrderLineItems,
-    order.Detail?.OrderLineItems,
+  const cands = [
+    order.items, order.Items,
+    order.OrderLineItems, order.Lines,
+    order.OrderDetails, order.Details?.OrderLineItems,
+    order.Detail?.OrderLineItems
   ].filter(Boolean);
-
-  for (const c of candidates) {
-    if (Array.isArray(c)) return c;
-  }
+  for (const c of cands) if (Array.isArray(c)) return c;
   return [];
 }
 
-/**
- * Normalize an item into fields our SQL expects.
- */
 function mapItemForSql(it) {
   const orderItemId =
-    it?.id ??
-    it?.orderItemId ??
-    it?.OrderLineItemId ??
-    it?.OrderItemID ??
-    it?.OrderItemId ??
-    null;
+    it?.id ?? it?.orderItemId ?? it?.OrderLineItemId ?? it?.OrderItemID ?? it?.OrderItemId ?? null;
 
   const sku =
-    it?.sku ??
-    it?.SKU ??
-    it?.ItemId ??
-    it?.ItemID ??
-    it?.ItemCode ??
-    it?.ItemIdentifier?.Sku ??
-    it?.ItemIdentifier?.SKU ??
-    it?.ItemIdentifier?.ItemCode ??
-    "";
+    it?.sku ?? it?.SKU ?? it?.ItemId ?? it?.ItemID ?? it?.ItemCode ??
+    it?.ItemIdentifier?.Sku ?? it?.ItemIdentifier?.SKU ?? it?.ItemIdentifier?.ItemCode ?? "";
 
-  const orderedQty = Number(
-    it?.quantity ?? it?.Quantity ?? it?.Qty ?? it?.OrderedQty ?? 0
-  );
+  const orderedQty = Number(it?.quantity ?? it?.Quantity ?? it?.Qty ?? it?.OrderedQty ?? 0);
 
   const qualifier =
-    it?.qualifier ??
-    it?.Qualifier ??
-    it?.UOM ??
-    (it?.UnitOfMeasure?.Name || it?.UnitOfMeasure) ??
-    "";
+    it?.qualifier ?? it?.Qualifier ?? it?.UOM ??
+    (it?.UnitOfMeasure?.Name || it?.UnitOfMeasure) ?? "";
 
   return { orderItemId, sku, orderedQty, qualifier };
+}
+
+function getOrderId(o) {
+  return o?.ReadOnly?.OrderId ?? o?.OrderId ?? o?.orderId ?? o?.Id ?? o?.ID ?? o?.id ?? null;
 }
 
 // ---------------- AUTH (Basic or Bearer) ----------------
@@ -177,7 +138,7 @@ export async function authHeaders() {
     h.Authorization = `Basic ${b64}`;
   }
 
-  // Scoping preferred via headers on legacy
+  // legacy scoping prefers headers (no query params)
   if (process.env.EXT_CUSTOMER_IDS) {
     h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS;
     h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS;
@@ -194,40 +155,80 @@ export async function authHeaders() {
   return h;
 }
 
-// ---------------- Fetch orders and upsert to SQL ----------------
+// ---------- per-order details ----------
+async function fetchOrderDetails(base, headers, orderId) {
+  const urls = [
+    `${base}/orders/${orderId}`,                 // legacy details
+    `${base}/api/v1/orders/${orderId}`,         // v1 details
+  ];
+
+  // Try plain first; if needed, try with expand hints that some tenants accept
+  const attempts = [];
+  for (const url of urls) {
+    // A) no params
+    try {
+      const r = await axios.get(url, { headers, timeout: TIMEOUT });
+      return r.data;
+    } catch (e) {
+      attempts.push({ url, status: e.response?.status || null });
+    }
+    // B) with common expand keys (best-effort; harmless if ignored)
+    try {
+      const r = await axios.get(url, { headers, params: { expand: "OrderLineItems,Items,Details" }, timeout: TIMEOUT });
+      return r.data;
+    } catch (e) {
+      attempts.push({ url, status: e.response?.status || null });
+    }
+  }
+  // If nothing worked, return null to skip this order silently
+  return null;
+}
+
+async function runPool(ids, worker) {
+  const q = [...ids];
+  const running = new Set();
+  const results = [];
+  while (q.length || running.size) {
+    while (q.length && running.size < CONCURRENCY) {
+      const id = q.shift();
+      const p = Promise.resolve().then(() => worker(id))
+        .then((r) => { results.push(r); running.delete(p); })
+        .catch((_e) => { running.delete(p); });
+      running.add(p);
+    }
+    if (running.size) await Promise.race(running);
+  }
+  return results;
+}
+
+// ---------------- Fetch headers, then details → upsert items ----------------
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const pool = await getPool();
 
-  // Use legacy first (no query params), then fallbacks (with params if ever needed)
+  // 1) pull header list (legacy first, no query params)
   const endpoints = [
     { url: `${base}/orders`, isLegacy: true },
     { url: `${base}/api/v1/orders`, isLegacy: false },
     { url: `${base}/api/orders`, isLegacy: false },
   ];
 
-  let importedHeaders = 0;
-  let upsertedItems = 0;
-
-  // One pass for legacy (no paging supported / allowed). If it fails, fall back to others.
   let orders = [];
   let lastErr = null;
-
   const headers = await authHeaders();
+
   for (const ep of endpoints) {
     try {
       const resp = await axios.get(ep.url, {
         headers,
-        ...(ep.isLegacy
-          ? {}
-          : {
-              params: {
-                page: 1,
-                pageSize,
-                ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
-                ...(status ? { status } : {}),
-              },
-            }),
+        ...(ep.isLegacy ? {} : {
+          params: {
+            page: 1,
+            pageSize,
+            ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
+            ...(status ? { status } : {}),
+          }
+        }),
         timeout: TIMEOUT,
       });
       orders = listify(resp.data);
@@ -244,21 +245,28 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
     console.error("[Extensiv /orders error]", lastErr.response?.status, lastErr.response?.data || lastErr.message);
     throw lastErr;
   }
-  importedHeaders = Array.isArray(orders) ? orders.length : 0;
+
+  const importedHeaders = Array.isArray(orders) ? orders.length : 0;
   if (!importedHeaders) return { importedHeaders: 0, upsertedItems: 0 };
 
-  // Upsert line items if present
-  const tx = new sql.Transaction(await getPool());
+  // 2) fetch details for each header to get line items
+  const orderIds = orders.map(getOrderId).filter((x) => x != null);
+  const detailsPayloads = await runPool(orderIds, (id) => fetchOrderDetails(base, headers, id));
+
+  // 3) upsert items
+  let upsertedItems = 0;
+  const tx = new sql.Transaction(pool);
   await tx.begin();
   try {
     const req = new sql.Request(tx);
-    for (const o of orders) {
-      const items = extractItems(o);
+    for (const p of detailsPayloads) {
+      if (!p) continue;
+      const items = extractItems(p);
       if (!items.length) continue;
 
       for (const it of items) {
         const { orderItemId, sku, orderedQty, qualifier } = mapItemForSql(it);
-        if (orderItemId == null && !sku) continue; // nothing to index
+        if (orderItemId == null && !sku) continue;
 
         await req
           .input("OrderItemID", sql.Int, orderItemId)
