@@ -1,176 +1,99 @@
-// app/services/extensivClient.js (ESM)
+// app/services/extensivClient.js
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-// Cache token + which token endpoint/mode worked
-let tokenCache = { access_token: null, exp: 0, winner: null };
+let tokenCache = { access_token: null, exp: 0 };
 
-function baseUrl() {
-  const b = (process.env.EXT_BASE_URL || "").replace(/\/+$/, "");
-  if (!b) throw new Error("Missing EXT_BASE_URL");
-  return b;
+function apiBase() {
+  // prefer EXT_API_BASE; else EXT_BASE_URL; else secure-wms.com
+  return (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com").replace(/\/+$/,"");
 }
 
-// Try several common OAuth endpoints + param styles, cache the winner
 export async function getAccessToken() {
   const now = Date.now();
-  if (tokenCache.access_token && now < tokenCache.exp - 60_000) {
-    return tokenCache.access_token;
-  }
+  if (tokenCache.access_token && now < tokenCache.exp - 60_000) return tokenCache.access_token;
 
-  const base = baseUrl();
-  const clientId     = process.env.EXT_CLIENT_ID;
+  const clientId = process.env.EXT_CLIENT_ID;
   const clientSecret = process.env.EXT_CLIENT_SECRET;
-  const userLogin    = process.env.EXT_USER_LOGIN;
-  const tplguid      = process.env.EXT_TPL_GUID;
-  const userLoginId  = process.env.EXT_USER_LOGIN_ID;
-
+  const tplId = process.env.EXT_TPL || process.env.EXT_TPL_ID;    // e.g. "8179"
+  const tplGuid = process.env.EXT_TPL_GUID;                        // optional GUID
+  const userLoginId = process.env.EXT_USER_LOGIN_ID;               // e.g. "246"
   if (!clientId || !clientSecret) throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET");
-  if (!userLogin || !tplguid)     throw new Error("Missing EXT_USER_LOGIN / EXT_TPL_GUID");
+  if (!userLoginId) throw new Error("Missing EXT_USER_LOGIN_ID");
+  if (!tplId && !tplGuid) throw new Error("Missing EXT_TPL or EXT_TPL_GUID");
 
-  // Candidate endpoints seen on box/secure-wms tenants
-  const urls = [
-    `${base}/api/v1/oauth/token`,
-    `${base}/oauth/token`,
-    `${base}/api/oauth/token`,
-  ];
-
-  // Modes:
-  //  A) Basic header with id:secret ; body has grant + user_login + tpl*
-  //  B) No Basic header; id/secret go in the body
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-  const authModes = [
-    {
-      name: "basic+body",
-      headers: { "Content-Type":"application/x-www-form-urlencoded", "Authorization": `Basic ${basic}` },
-      bodyMaker: (tplKey, uliKey) => {
-        const p = new URLSearchParams({ grant_type:"client_credentials", user_login:userLogin });
-        p.append(tplKey, tplguid);
-        if (userLoginId) p.append(uliKey, userLoginId);
-        return p;
-      }
+  const tokenUrl = "https://secure-wms.com/AuthServer/api/Token";  // per docs
+
+  const body = {
+    grant_type: "client_credentials",
+    user_login_id: userLoginId,
+    ...(tplGuid ? { tplguid: tplGuid } : { tpl: tplId })
+  };
+
+  const resp = await axios.post(tokenUrl, body, {
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Accept": "application/json",
+      "Authorization": `Basic ${basic}`
     },
-    {
-      name: "body-only",
-      headers: { "Content-Type":"application/x-www-form-urlencoded" },
-      bodyMaker: (tplKey, uliKey) => {
-        const p = new URLSearchParams({
-          grant_type: "client_credentials",
-          client_id: clientId,
-          client_secret: clientSecret,
-          user_login: userLogin
-        });
-        p.append(tplKey, tplguid);
-        if (userLoginId) p.append(uliKey, userLoginId);
-        return p;
-      }
-    }
-  ];
+    timeout: 20000
+  });
 
-  // Some tenants use tplguid vs tpl ; user_login_id vs userLoginId
-  const tplKeys = ["tplguid", "tpl"];
-  const uliKeys = ["user_login_id", "userLoginId"];
-
-  const attempts = [];
-  for (const url of urls) {
-    for (const mode of authModes) {
-      for (const tplKey of tplKeys) {
-        for (const uliKey of uliKeys) {
-          try {
-            const resp = await axios.post(url, mode.bodyMaker(tplKey, uliKey), {
-              headers: mode.headers,
-              timeout: 20000
-            });
-            const { access_token, expires_in = 3600 } = resp.data || {};
-            if (!access_token) throw new Error(`No access_token at ${url} (${mode.name}/${tplKey}/${uliKey})`);
-            tokenCache = {
-              access_token,
-              exp: Date.now() + expires_in * 1000,
-              winner: { url, mode: mode.name, tplKey, uliKey }
-            };
-            if (process.env.LOG_TOKEN_DEBUG === "true") {
-              console.log("[OAuth winner]", tokenCache.winner);
-            }
-            return access_token;
-          } catch (e) {
-            attempts.push({
-              url, mode: mode.name, tplKey, uliKey,
-              status: e.response?.status ?? null,
-              data: e.response?.data ?? String(e.message)
-            });
-          }
-        }
-      }
-    }
-  }
-
-  throw new Error("OAuth token failed. First attempts:\n" + JSON.stringify(attempts.slice(0,4), null, 2));
+  const { access_token, expires_in = 1800 } = resp.data || {};
+  if (!access_token) throw new Error("No access_token in token response");
+  tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
+  return access_token;
 }
 
-// ✅ Named export that routes import: { authHeaders }
 export async function authHeaders() {
-  const bearer = await getAccessToken();
+  const token = await getAccessToken();
   const h = {
-    Authorization: `Bearer ${bearer}`,
+    Authorization: `Bearer ${token}`,
     Accept: "application/json",
-    "Content-Type": "application/json",
+    "Content-Type": "application/json"
   };
-  // Common sandbox scoping
-  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // "ALL" or "123,456"
+  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // "ALL" or "1,2,3"
   if (process.env.EXT_FACILITY_IDS) h["FacilityIds"] = process.env.EXT_FACILITY_IDS; // "ALL" or "10,20"
-  // Some tenants still require 3PL headers
   if (process.env.EXT_WAREHOUSE_ID) h["3PL-Warehouse-Id"] = process.env.EXT_WAREHOUSE_ID;
   if (process.env.EXT_CUSTOMER_ID)  h["3PL-Customer-Id"]  = process.env.EXT_CUSTOMER_ID;
   return h;
 }
 
-// ✅ Named export that routes import: { fetchAndUpsertOrders }
 export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
-  const base = baseUrl();
   const pool = await getPool();
-  let page = 1;
-  let imported = 0;
+  const base = apiBase();
+  let page = 1, imported = 0;
 
   while (true) {
-    // ----- call orders API (prefer v1 path; fallback to legacy) -----
-    let list = [];
+    // try modern and legacy paths
+    const headers = await authHeaders();
+    let dataList = [];
     try {
-      const headers = await authHeaders();
-      let resp;
-      try {
-        resp = await axios.get(`${base}/api/v1/orders`, {
-          headers,
-          params: { page, pageSize, ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}), ...(status ? { status } : {}) },
-          timeout: 20000
+      let r = await axios.get(`${base}/api/v1/orders`, {
+        headers, params: { page, pageSize, ...(modifiedSince && { modifiedDateStart: modifiedSince }), ...(status && { status }) }, timeout: 20000
+      });
+      const d = r.data;
+      dataList = Array.isArray(d?.data) ? d.data : (Array.isArray(d) ? d : []);
+    } catch (e1) {
+      if (e1.response?.status === 404) {
+        const r = await axios.get(`${base}/orders`, {
+          headers, params: { page, pageSize, ...(modifiedSince && { modifiedDateStart: modifiedSince }), ...(status && { status }) }, timeout: 20000
         });
-      } catch (e1) {
-        if (e1.response?.status === 404) {
-          resp = await axios.get(`${base}/orders`, {
-            headers,
-            params: { page, pageSize, ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}), ...(status ? { status } : {}) },
-            timeout: 20000
-          });
-        } else {
-          throw e1;
-        }
+        const d = r.data;
+        dataList = Array.isArray(d?.data) ? d.data : (Array.isArray(d) ? d : []);
+      } else {
+        throw e1;
       }
-      const data = resp.data;
-      list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
-    } catch (err) {
-      console.error("[Extensiv /orders error]", err.response?.status, err.response?.data || err.message);
-      throw err;
     }
+    if (!dataList.length) break;
 
-    if (!list.length) break;
-
-    // ----- upsert items into SQL -----
     const tx = new sql.Transaction(pool);
     await tx.begin();
     try {
       const req = new sql.Request(tx);
-      for (const o of list) {
-        const items = Array.isArray(o.items) ? o.items : [];
-        for (const it of items) {
+      for (const o of dataList) {
+        for (const it of (o.items || [])) {
           await req
             .input("OrderItemID", sql.Int, it.id ?? it.orderItemId ?? null)
             .input("ItemID", sql.VarChar(100), it.sku ?? "")
@@ -180,25 +103,21 @@ export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 1
               MERGE [dbo].[OrderDetails] AS t
               USING (SELECT @OrderItemID AS OrderItemID) s
               ON t.OrderItemID = s.OrderItemID
-              WHEN MATCHED THEN 
-                UPDATE SET ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQty
-              WHEN NOT MATCHED THEN 
-                INSERT (OrderItemID, ItemID, Qualifier, OrderedQTY)
-                VALUES (@OrderItemID, @ItemID, @Qualifier, @OrderedQty);
+              WHEN MATCHED THEN UPDATE SET ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQty
+              WHEN NOT MATCHED THEN INSERT (OrderItemID, ItemID, Qualifier, OrderedQTY)
+              VALUES (@OrderItemID, @ItemID, @Qualifier, @OrderedQty);
             `);
         }
       }
       await tx.commit();
     } catch (e) {
       await tx.rollback();
-      console.error("[SQL upsert error]", e);
       throw e;
     }
 
-    imported += list.length;
-    if (list.length < pageSize) break;
+    imported += dataList.length;
+    if (dataList.length < pageSize) break;
     page++;
   }
-
   return { imported };
 }
