@@ -1,103 +1,83 @@
-// app/services/extensivClient.js
 import axios from "axios";
-import { getPool, sql } from "./db/mssql.js";
+import qs from "qs";
 
-let tokenCache = { access_token: null, exp: 0 };
+// Cached token & expiry
+let tokenCache = { token: null, expires: 0 };
 
-async function getAccessToken() {
+async function getBearerToken() {
   const now = Date.now();
-  if (tokenCache.access_token && now < tokenCache.exp - 60_000) return tokenCache.access_token;
+  if (tokenCache.token && now < tokenCache.expires) {
+    return tokenCache.token;
+  }
 
-  const id = process.env.EXT_CLIENT_ID;
-  const secret = process.env.EXT_CLIENT_SECRET;
-  if (!id || !secret) throw new Error("Missing EXT_CLIENT_ID / EXT_CLIENT_SECRET");
-
-  const basic = Buffer.from(`${id}:${secret}`).toString("base64");
-
-  const params = new URLSearchParams({
+  const payload = {
     grant_type: "client_credentials",
-    user_login: process.env.EXT_USER_LOGIN || "",
-    tplguid:    process.env.EXT_TPL_GUID || ""
-  });
-  if (process.env.EXT_USER_LOGIN_ID) params.append("user_login_id", process.env.EXT_USER_LOGIN_ID);
-
-  const resp = await axios.post(
-    `${process.env.EXT_BASE_URL}/oauth/token`,
-    params,
-    { headers: { Authorization: `Basic ${basic}`, "Content-Type": "application/x-www-form-urlencoded" } }
-  );
-
-  const { access_token, expires_in = 3600 } = resp.data || {};
-  if (!access_token) throw new Error("No access_token in OAuth response");
-  tokenCache = { access_token, exp: Date.now() + expires_in * 1000 };
-  return access_token;
-}
-
-export async function authHeaders() {
-  const bearer = await getAccessToken();
-  const h = {
-    Authorization: `Bearer ${bearer}`,
-    Accept: "application/json",
-    "Content-Type": "application/json",
+    client_id: process.env.EXT_CLIENT_ID,
+    client_secret: process.env.EXT_CLIENT_SECRET,
+    user_login: process.env.EXT_USER_LOGIN,
+    tplguid: process.env.EXT_TPL_GUID
   };
-  // Box sandbox commonly expects these scope headers
-  if (process.env.EXT_CUSTOMER_IDS) h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS; // e.g. ALL or "123,456"
-  if (process.env.EXT_FACILITY_IDS) h["FacilityIds"] = process.env.EXT_FACILITY_IDS; // e.g. ALL or "10,20"
-  return h;
+
+  try {
+    const { data } = await axios.post(
+      `${process.env.EXT_BASE_URL}/api/v1/oauth/token`,
+      qs.stringify(payload),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    if (!data?.access_token) {
+      throw new Error("No access_token in OAuth response: " + JSON.stringify(data));
+    }
+
+    tokenCache.token = data.access_token;
+    tokenCache.expires = now + (data.expires_in ? data.expires_in * 1000 : 10 * 60 * 1000);
+
+    return tokenCache.token;
+  } catch (err) {
+    console.error("OAuth token fetch failed:", err.response?.data || err.message);
+    throw err;
+  }
 }
 
-export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
-  let page = 1, imported = 0;
-  const pool = await getPool();
+export async function fetchOrders({ modifiedSince, status, pageSize = 100 } = {}) {
+  const token = await getBearerToken();
+  let page = 1;
+  let allOrders = [];
 
   while (true) {
-    let list = [];
-    try {
-      const headers = await authHeaders();
-      const resp = await axios.get(`${process.env.EXT_BASE_URL}/orders`, {
-        headers,
-        params: { modifiedDateStart: modifiedSince, status, page, pageSize }
-      });
-      const data = resp.data;
-      list = Array.isArray(data?.data) ? data.data : (Array.isArray(data) ? data : []);
-    } catch (err) {
-      console.error("[Extensiv import] HTTP error", err.response?.status, err.response?.data || err.message);
-      throw err;
-    }
-    if (!list.length) break;
-
-    const tx = new sql.Transaction(pool);
-    await tx.begin();
-    try {
-      const req = new sql.Request(tx);
-      for (const o of list) {
-        for (const it of (o.items || [])) {
-          await req
-            .input("OrderItemID", sql.Int, it.id ?? it.orderItemId ?? null)
-            .input("ItemID", sql.VarChar(100), it.sku ?? "")
-            .input("Qualifier", sql.VarChar(50), it.qualifier ?? "")
-            .input("OrderedQty", sql.Int, Number(it.quantity ?? 0))
-            .query(`
-              MERGE [dbo].[OrderDetails] AS t
-              USING (SELECT @OrderItemID AS OrderItemID) s
-              ON t.OrderItemID = s.OrderItemID
-              WHEN MATCHED THEN UPDATE SET ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQty
-              WHEN NOT MATCHED THEN INSERT (OrderItemID, ItemID, Qualifier, OrderedQTY)
-              VALUES (@OrderItemID, @ItemID, @Qualifier, @OrderedQty);
-            `);
+    const { data } = await axios.get(
+      `${process.env.EXT_BASE_URL}/api/v1/orders`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json"
+        },
+        params: {
+          modifiedDateStart: modifiedSince,
+          status,
+          page,
+          pageSize,
+          facilityIDs: process.env.EXT_FACILITY_IDS,
+          customerIDs: process.env.EXT_CUSTOMER_IDS
         }
       }
-      await tx.commit();
-    } catch (e) {
-      await tx.rollback();
-      console.error("[SQL upsert error]", e);
-      throw e;
-    }
+    );
 
-    imported += list.length;
+    const list = Array.isArray(data) ? data : (Array.isArray(data?.data) ? data.data : []);
+    if (!list.length) break;
+
+    allOrders.push(...list);
     if (list.length < pageSize) break;
     page++;
   }
 
-  return { imported };
+  return allOrders;
+}
+
+export async function fetchAndUpsertOrdersToDB(db) {
+  const orders = await fetchOrders({ pageSize: 50 });
+  console.log(`Fetched ${orders.length} orders from Extensiv`);
+
+  // Insert into your SQL here if needed
+  return orders.length;
 }
