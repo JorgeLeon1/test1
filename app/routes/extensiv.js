@@ -5,12 +5,13 @@ import axios from "axios";
 import {
   authHeaders,
   fetchAndUpsertOrders,
-  fetchOneOrderDetail,
+  fetchOneOrderDetail,   // remove the /peekOrder route below if you don't export this
 } from "../services/extensivClient.js";
 
 import { importInventory } from "../services/inventoryClient.js";
 import { runAllocationAndRead } from "../services/allocService.js";
 import { pushAllocations } from "../services/pushAllocations.js";
+// If your mssql helper is at src/db/mssql.js, use "../../db/mssql.js" instead:
 import { getPool } from "../services/db/mssql.js";
 
 /* --------------------------- init router FIRST --------------------------- */
@@ -18,11 +19,19 @@ const r = Router();
 
 /* ------------------------------ helpers ---------------------------------- */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
+
+// Find the first array in typical Extensiv responses (HAL & legacy)
 const firstArray = (data) => {
+  if (!data) return [];
+  // HAL orders
+  const hal = data?._embedded?.["http://api.3plCentral.com/rels/orders/order"];
+  if (Array.isArray(hal)) return hal;
+  // Legacy lists
+  if (Array.isArray(data.ResourceList)) return data.ResourceList;
+  if (Array.isArray(data.data)) return data.data;
   if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.ResourceList)) return data.ResourceList;
-  if (Array.isArray(data?.data)) return data.data;
-  for (const v of Object.values(data || {})) if (Array.isArray(v)) return v;
+  // last resort
+  for (const v of Object.values(data)) if (Array.isArray(v)) return v;
   return [];
 };
 
@@ -52,7 +61,7 @@ r.get("/_debug", (_req, res) => {
   });
 });
 
-r.get("/token", async (_req, res, next) => {
+r.get("/token", async (_req, res) => {
   try {
     const h = await authHeaders();
     const bearer = h.Authorization?.startsWith("Bearer ")
@@ -65,28 +74,43 @@ r.get("/token", async (_req, res, next) => {
       tail: bearer.slice(-8),
     });
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
 /* --------------------------------- PEEK ---------------------------------- */
 
-r.get("/peek", async (_req, res, next) => {
+r.get("/peek", async (_req, res) => {
   try {
     const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+      process.env.EXT_API_BASE ||
+      process.env.EXT_BASE_URL ||
+      "https://box.secure-wms.com"
     );
-    const h = await authHeaders();
-    const resp = await axios.get(`${base}/orders`, { headers: h, timeout: 15000 });
+    const headers = await authHeaders();
+    const resp = await axios.get(`${base}/orders`, {
+      headers: { ...headers, "Accept-Language": "en-US,en;q=0.8" },
+      params: { pgsiz: 1, pgnum: 1, detail: "OrderItems", itemdetail: "All" },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+
     const data = resp.data;
     const list = firstArray(data);
 
-    res.json({
-      ok: true,
+    res.status(resp.status).json({
+      ok: resp.status < 400,
       status: resp.status,
       topLevelType: Array.isArray(data) ? "array" : "object",
       keys: data && typeof data === "object" ? Object.keys(data) : [],
-      firstArrayKey: Array.isArray(data?.ResourceList)
+      firstArrayKey: Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])
+        ? "HAL:_embedded[rels/orders/order]"
+        : Array.isArray(data?.ResourceList)
         ? "ResourceList"
         : Array.isArray(data?.data)
         ? "data"
@@ -97,21 +121,27 @@ r.get("/peek", async (_req, res, next) => {
       sample: list[0] || data,
     });
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
-r.get("/peekOrder", async (req, res, next) => {
+r.get("/peekOrder", async (req, res) => {
   try {
     const id = Number(req.query.id);
     if (!id) return res.status(400).json({ ok: false, message: "Provide ?id=<OrderId>" });
 
     const payload = await fetchOneOrderDetail(id);
-    const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
-
-    let itemArrayKey = "unknown";
     let items = [];
-    if (Array.isArray(payload?.OrderLineItems)) {
+    let itemArrayKey = "unknown";
+    if (Array.isArray(payload?._embedded?.["http://api.3plCentral.com/rels/orders/item"])) {
+      itemArrayKey = "HAL:_embedded[rels/orders/item]";
+      items = payload._embedded["http://api.3plCentral.com/rels/orders/item"];
+    } else if (Array.isArray(payload?.OrderLineItems)) {
       itemArrayKey = "OrderLineItems";
       items = payload.OrderLineItems;
     } else if (Array.isArray(payload?.Items)) {
@@ -128,55 +158,80 @@ r.get("/peekOrder", async (req, res, next) => {
     res.json({
       ok: true,
       orderId: id,
-      keys,
+      keys: payload && typeof payload === "object" ? Object.keys(payload) : [],
       itemArrayKey,
       itemsFound: items.length,
       sampleItem: items[0] || null,
     });
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
 /* ------------------------------- ACTIONS --------------------------------- */
 
 // Inventory → dbo.Inventory
-r.post("/inventory-import", async (_req, res, next) => {
+r.post("/inventory-import", async (_req, res) => {
   try {
     const result = await importInventory();
     res.json(result);
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
-// Orders + details → dbo.OrderDetails
-r.post("/import", async (req, res, next) => {
+// Orders + details → dbo.OrderHeaders / dbo.OrderDetails
+r.post("/import", async (req, res) => {
   try {
     const result = await fetchAndUpsertOrders(req.body || {});
     res.json(result);
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
 // Allocate using dbo.Inventory → dbo.Allocations
-r.post("/allocate", async (_req, res, next) => {
+r.post("/allocate", async (_req, res) => {
   try {
     const { applied, rows } = await runAllocationAndRead();
     res.json({ applied, suggestions: rows });
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
 // Preview payload to push back to Extensiv (stub)
-r.post("/push", async (_req, res, next) => {
+r.post("/push", async (_req, res) => {
   try {
     const result = await pushAllocations();
     res.json(result);
   } catch (e) {
-    next(e);
+    res.status(e.response?.status || 500).json({
+      ok: false,
+      status: e.response?.status,
+      message: e.message,
+      data: e.response?.data || "",
+    });
   }
 });
 
@@ -189,9 +244,16 @@ r.get("/selftest", async (_req, res) => {
     out.steps.auth = "ok";
 
     const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+      process.env.EXT_API_BASE ||
+      process.env.EXT_BASE_URL ||
+      "https://box.secure-wms.com"
     );
-    const o = await axios.get(`${base}/orders`, { headers, timeout: 15000 });
+    const o = await axios.get(`${base}/orders`, {
+      headers: { ...headers, "Accept-Language": "en-US,en;q=0.8" },
+      params: { pgsiz: 1, pgnum: 1 },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
     const list = firstArray(o.data);
     out.steps.orders = { status: o.status, count: list.length };
 
@@ -200,13 +262,24 @@ r.get("/selftest", async (_req, res) => {
     out.steps.db = "connect-ok";
 
     await pool.request().batch(`
+IF OBJECT_ID('dbo.OrderHeaders','U') IS NULL
+  CREATE TABLE dbo.OrderHeaders (
+    OrderId            INT          NOT NULL PRIMARY KEY,
+    ReferenceNum       NVARCHAR(200) NULL,
+    CustomerId         INT           NULL,
+    FacilityId         INT           NULL,
+    Status             INT           NULL,
+    ProcessDate        DATETIME2     NULL,
+    LastModifiedDate   DATETIME2     NULL
+  );
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
   CREATE TABLE dbo.OrderDetails (
-    OrderItemID INT NULL,
-    OrderId     INT NULL,
-    ItemID      VARCHAR(100) NULL,
-    Qualifier   VARCHAR(50) NULL,
-    OrderedQTY  INT NULL
+    OrderItemID INT           NOT NULL PRIMARY KEY,
+    OrderId     INT           NOT NULL,
+    ItemID      NVARCHAR(200) NULL,
+    SKU         NVARCHAR(200) NULL,
+    Qualifier   NVARCHAR(50)  NULL,
+    OrderedQTY  DECIMAL(18,4) NULL
   );
 IF OBJECT_ID('dbo.Inventory','U') IS NULL
   CREATE TABLE dbo.Inventory (
@@ -233,7 +306,7 @@ IF OBJECT_ID('dbo.Allocations','U') IS NULL
     out.ok = true;
     res.json(out);
   } catch (e) {
-    res.status(500).json({
+    res.status(e.response?.status || 500).json({
       ok: false,
       where: out.steps.auth
         ? out.steps.orders
@@ -242,9 +315,9 @@ IF OBJECT_ID('dbo.Allocations','U') IS NULL
             : "db"
           : "orders"
         : "auth",
-      status: e.response?.status || 500,
+      status: e.response?.status,
       message: e.message,
-      data: e.response?.data,
+      data: e.response?.data || "",
     });
   }
 });
