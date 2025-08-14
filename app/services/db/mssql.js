@@ -1,17 +1,21 @@
-import sql from "mssql";
+// src/app/services/db/mssql.js
+import mssql from "mssql";
 
-let pool;
+const cfg = {
+  user: process.env.SQL_USER,
+  password: process.env.SQL_PASSWORD,
+  server: process.env.SQL_SERVER,     // e.g. "72.167.50.108"
+  database: process.env.SQL_DATABASE, // e.g. "master"
+  port: 1433,
+  options: { encrypt: true, trustServerCertificate: true },
+  pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
+};
+
+let _pool;
 export async function getPool() {
-  if (pool) return pool;
-  pool = await sql.connect({
-    server: process.env.SQL_SERVER,
-    database: process.env.SQL_DATABASE,
-    user: process.env.SQL_USER,
-    password: process.env.SQL_PASSWORD,
-    options: { trustServerCertificate: true },
-    pool: { max: 10 }
-  });
-  return pool;
+  if (_pool && _pool.connected) return _pool;
+  _pool = await mssql.connect(cfg);
+  return _pool;
 }
 
-export { sql };
+export const sql = mssql;
