@@ -2,14 +2,10 @@
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-/* ============ small helpers ============ */
+/* --------------------- tiny helpers --------------------- */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
-const s = (v, n, def = "") => (v == null ? def : String(v).normalize("NFC").slice(0, n));
-const i = (v, def = 0) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : def;
-};
-
+const s = (v, n, d = "") => (v == null ? d : String(v).normalize("NFC").slice(0, n));
+const i = (v, d = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : d);
 const ro = (o) => o?.readOnly || o?.ReadOnly || {};
 
 function firstArray(obj) {
@@ -32,7 +28,7 @@ function orderItems(ord) {
   return [];
 }
 
-/* ============ auth (basic / oauth) ============ */
+/* ---------------------- auth helpers --------------------- */
 function basicHeaderFromEnv() {
   const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
   return b64 ? `Basic ${b64}` : null;
@@ -47,6 +43,7 @@ async function getBearerViaOAuth() {
     if (process.env.EXT_USER_LOGIN)    form.set("user_login",    process.env.EXT_USER_LOGIN);
     if (process.env.EXT_USER_LOGIN_ID) form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
     if (process.env.EXT_TPL_GUID)      form.set("tplguid",       process.env.EXT_TPL_GUID);
+
     const auth = basicHeaderFromEnv();
     const resp = await axios.post(tokenUrl, form, {
       headers: {
@@ -79,7 +76,7 @@ export async function authHeaders() {
     }
   }
   const basic = basicHeaderFromEnv();
-  if (!basic) throw new Error("No auth configured: EXT_BASIC_AUTH_B64 or EXT_TOKEN_URL (+ client id/secret) required.");
+  if (!basic) throw new Error("No auth configured: set EXT_BASIC_AUTH_B64 or EXT_TOKEN_URL (+ client id/secret).");
   return {
     Authorization: basic,
     Accept: "application/hal+json, application/json",
@@ -87,11 +84,20 @@ export async function authHeaders() {
   };
 }
 
-/* ============ API calls ============ */
-async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1 }) {
+/* ---------------------- API wrappers --------------------- */
+function buildOrderRql({ onlyOpen = true, onlyUnallocated = false } = {}) {
+  const terms = [];
+  // For RQL, status is only reliable for Canceled; use isClosed for open.
+  if (onlyOpen) terms.push("readOnly.isClosed==false");
+  if (onlyUnallocated) terms.push("readOnly.fullyAllocated==false");
+  return terms.length ? terms.join(";") : undefined;
+}
+
+async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1, onlyOpen = true, onlyUnallocated = false }) {
+  const rql = buildOrderRql({ onlyOpen, onlyUnallocated });
   const { data } = await axios.get(`${base}/orders`, {
     headers,
-    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
+    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All", ...(rql ? { rql } : {}) },
     timeout: 30000,
   });
   return data;
@@ -100,6 +106,7 @@ async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1 }) {
 export async function fetchOneOrderDetail(orderId) {
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const headers = await authHeaders();
+
   try {
     const { data } = await axios.get(`${base}/orders`, {
       headers,
@@ -110,7 +117,7 @@ export async function fetchOneOrderDetail(orderId) {
     if (list?.[0]) return list[0];
   } catch {}
   try {
-    const page = await listOrdersPage({ base, headers, pgsiz: 100, pgnum: 1 });
+    const page = await listOrdersPage({ base, headers, pgsiz: 100, pgnum: 1, onlyOpen: true });
     const list = firstArray(page);
     return list.find(o => (ro(o).orderId ?? ro(o).OrderId ?? o.orderId ?? o.OrderId) === orderId) || null;
   } catch {
@@ -118,9 +125,8 @@ export async function fetchOneOrderDetail(orderId) {
   }
 }
 
-/* ============ DB bootstrap ============ */
-async function ensureOrderDetailsTable(pool) {
-  // Create table with all required columns if missing
+/* ------------------ DB bootstrap / schema probe ------------------ */
+async function ensureOrderDetailsBase(pool) {
   await pool.request().batch(`
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
 BEGIN
@@ -129,7 +135,9 @@ BEGIN
     OrderId         INT           NOT NULL DEFAULT(0),
     CustomerID      INT           NOT NULL DEFAULT(0),
     CustomerName    VARCHAR(200)  NOT NULL DEFAULT(''),
-    ItemID          VARCHAR(150)  NOT NULL DEFAULT(''),
+    -- Some DBs use ItemID, others use SKU; we will populate whichever exists (or both)
+    ItemID          VARCHAR(150)  NULL,
+    SKU             VARCHAR(150)  NULL,
     UnitID          INT           NULL,
     UnitName        VARCHAR(50)   NULL,
     Qualifier       VARCHAR(80)   NULL,
@@ -142,58 +150,41 @@ BEGIN
   );
 END
 `);
-
-  // Add any missing columns (for existing environments)
-  const addCol = async (name, spec) => {
-    const rs = await pool.request().input("col", sql.VarChar(128), name).query(`
-      SELECT 1 AS ok FROM sys.columns
-      WHERE object_id = OBJECT_ID('dbo.OrderDetails') AND name = @col
-    `);
-    if (!rs.recordset.length) {
-      await pool.request().batch(`ALTER TABLE dbo.OrderDetails ADD ${name} ${spec};`);
-    }
-  };
-
-  await addCol("CustomerID",     "INT NOT NULL CONSTRAINT DF_OrderDetails_CustomerID DEFAULT(0)");
-  await addCol("CustomerName",   "VARCHAR(200) NOT NULL CONSTRAINT DF_OrderDetails_CustomerName DEFAULT('')");
-  await addCol("ItemID",         "VARCHAR(150) NOT NULL CONSTRAINT DF_OrderDetails_ItemID DEFAULT('')");
-  await addCol("UnitID",         "INT NULL");
-  await addCol("UnitName",       "VARCHAR(50) NULL");
-  await addCol("Qualifier",      "VARCHAR(80) NULL");
-  await addCol("OrderedQTY",     "INT NOT NULL CONSTRAINT DF_OrderDetails_OrderedQTY DEFAULT(0)");
-  await addCol("ReferenceNum",   "VARCHAR(100) NULL");
-  await addCol("ShipToAddress1", "VARCHAR(200) NULL");
-  await addCol("ShipToCity",     "VARCHAR(100) NULL");
-  await addCol("ShipToState",    "VARCHAR(50) NULL");
-  await addCol("ShipToZip",      "VARCHAR(20) NULL");
-
-  // Widen, if an older/narrow schema exists
-  await pool.request().batch(`
-IF COL_LENGTH('dbo.OrderDetails','CustomerName') < 200
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN CustomerName VARCHAR(200) NOT NULL;
-IF COL_LENGTH('dbo.OrderDetails','ItemID') < 150
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ItemID VARCHAR(150) NOT NULL;
-IF COL_LENGTH('dbo.OrderDetails','UnitName') < 50
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN UnitName VARCHAR(50) NULL;
-IF COL_LENGTH('dbo.OrderDetails','Qualifier') < 80
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN Qualifier VARCHAR(80) NULL;
-IF COL_LENGTH('dbo.OrderDetails','ReferenceNum') < 100
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ReferenceNum VARCHAR(100) NULL;
-IF COL_LENGTH('dbo.OrderDetails','ShipToAddress1') < 200
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ShipToAddress1 VARCHAR(200) NULL;
-IF COL_LENGTH('dbo.OrderDetails','ShipToCity') < 100
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ShipToCity VARCHAR(100) NULL;
-IF COL_LENGTH('dbo.OrderDetails','ShipToState') < 50
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ShipToState VARCHAR(50) NULL;
-IF COL_LENGTH('dbo.OrderDetails','ShipToZip') < 20
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ShipToZip VARCHAR(20) NULL;
-`);
 }
 
-/* ============ MAIN IMPORT ============ */
-export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {}) {
+async function getOrderDetailsColumns(pool) {
+  const rs = await pool.request().query(`
+    SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')
+  `);
+  const set = new Set(rs.recordset.map(r => r.name.toUpperCase()));
+  return {
+    hasItemID: set.has("ITEMID"),
+    hasSKU: set.has("SKU"),
+    // the rest are assumed present (created above) but we still guard
+    hasCustomerID: set.has("CUSTOMERID"),
+    hasCustomerName: set.has("CUSTOMERNAME"),
+    hasUnitID: set.has("UNITID"),
+    hasUnitName: set.has("UNITNAME"),
+    hasQualifier: set.has("QUALIFIER"),
+    hasOrderedQTY: set.has("ORDEREDQTY"),
+    hasReferenceNum: set.has("REFERENCENUM"),
+    hasShipToAddress1: set.has("SHIPTOADDRESS1"),
+    hasShipToCity: set.has("SHIPTOCITY"),
+    hasShipToState: set.has("SHIPTOSTATE"),
+    hasShipToZip: set.has("SHIPTOZIP"),
+  };
+}
+
+/* ---------------------- MAIN IMPORTER ---------------------- */
+export async function fetchAndUpsertOrders({
+  maxPages = 10,
+  pageSize = 200,
+  onlyOpen = true,          // << default: only open
+  onlyUnallocated = false,  //    set true to require unallocated too
+} = {}) {
   const pool = await getPool();
-  await ensureOrderDetailsTable(pool);
+  await ensureOrderDetailsBase(pool);
+  const cols = await getOrderDetailsColumns(pool);
 
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const headers = await authHeaders();
@@ -203,10 +194,9 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
   const errors = [];
 
   for (let pg = 1; pg <= maxPages; pg++) {
-    // fetch a page with items
     let page;
     try {
-      page = await listOrdersPage({ base, headers, pgsiz: pageSize, pgnum: pg });
+      page = await listOrdersPage({ base, headers, pgsiz: pageSize, pgnum: pg, onlyOpen, onlyUnallocated });
     } catch (e) {
       return {
         ok: false,
@@ -220,21 +210,19 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
     if (!orders.length) break;
     importedHeaders += orders.length;
 
-    // flatten rows (one per order item)
     const rows = [];
     for (const ord of orders) {
       const r = ro(ord);
-
       const orderId      = i(r.orderId ?? r.OrderId ?? ord.orderId ?? ord.OrderId, 0);
       const customerId   = i(r.customerIdentifier?.id ?? r.CustomerIdentifier?.Id ?? 0, 0);
       const customerName = s(r.customerIdentifier?.name ?? r.CustomerIdentifier?.Name ?? "", 200);
       const referenceNum = s(ord.referenceNum ?? ord.ReferenceNum ?? "", 100);
 
       const shipTo = ord.shipTo || {};
-      const addr1  = s(shipTo.address1, 200);
-      const city   = s(shipTo.city, 100);
-      const state  = s(shipTo.state, 50);
-      const zip    = s(shipTo.zip, 20);
+      const addr1  = s(shipTo.address1, 200, null);
+      const city   = s(shipTo.city, 100, null);
+      const state  = s(shipTo.state, 50, null);
+      const zip    = s(shipTo.zip, 20, null);
 
       for (const it of orderItems(ord)) {
         const ir   = ro(it);
@@ -248,8 +236,7 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
         const qualifier   = s(it.qualifier ?? it.Qualifier ?? "", 80);
         const qty         = i(it.qty ?? it.Qty ?? it.orderedQty ?? it.OrderedQty, 0);
 
-        if (!orderItemId) continue; // must have a key
-        // make sure required fields are non-empty
+        if (!orderItemId) continue;
         const safeSku = sku || "UNKNOWN";
 
         rows.push({
@@ -257,30 +244,28 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
           OrderId: orderId,
           CustomerID: customerId,
           CustomerName: customerName || "",
-          ItemID: safeSku,
+          ItemID: safeSku,     // we will map to ItemID and/or SKU depending on schema
+          SKU: safeSku,
           UnitID: unitId,
           UnitName: unitName || null,
           Qualifier: qualifier || null,
           OrderedQTY: qty,
           ReferenceNum: referenceNum || null,
-          ShipToAddress1: addr1 || null,
-          ShipToCity: city || null,
-          ShipToState: state || null,
-          ShipToZip: zip || null,
+          ShipToAddress1: addr1,
+          ShipToCity: city,
+          ShipToState: state,
+          ShipToZip: zip,
         });
       }
     }
 
-    // upsert each row (no transaction, so one bad row won’t abort all)
     for (const r of rows) {
       try {
-        await pool
-          .request()
+        const req = pool.request()
           .input("OrderItemID", sql.Int, r.OrderItemID)
           .input("OrderId", sql.Int, r.OrderId)
           .input("CustomerID", sql.Int, r.CustomerID)
           .input("CustomerName", sql.VarChar(200), r.CustomerName)
-          .input("ItemID", sql.VarChar(150), r.ItemID)
           .input("UnitID", sql.Int, r.UnitID)
           .input("UnitName", sql.VarChar(50), r.UnitName)
           .input("Qualifier", sql.VarChar(80), r.Qualifier)
@@ -289,30 +274,47 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
           .input("ShipToAddress1", sql.VarChar(200), r.ShipToAddress1)
           .input("ShipToCity", sql.VarChar(100), r.ShipToCity)
           .input("ShipToState", sql.VarChar(50), r.ShipToState)
-          .input("ShipToZip", sql.VarChar(20), r.ShipToZip)
-          .query(`
+          .input("ShipToZip", sql.VarChar(20), r.ShipToZip);
+
+        if (cols.hasItemID) req.input("ItemID", sql.VarChar(150), r.ItemID);
+        if (cols.hasSKU)    req.input("SKU",    sql.VarChar(150), r.SKU);
+
+        // Build dynamic SET & INSERT lists based on existing columns
+        const setPieces = [
+          "OrderId=@OrderId",
+          "CustomerID=@CustomerID",
+          "CustomerName=@CustomerName",
+          cols.hasItemID ? "ItemID=@ItemID" : null,
+          cols.hasSKU    ? "SKU=@SKU"       : null,
+          "UnitID=@UnitID",
+          "UnitName=@UnitName",
+          "Qualifier=@Qualifier",
+          "OrderedQTY=@OrderedQTY",
+          "ReferenceNum=@ReferenceNum",
+          "ShipToAddress1=@ShipToAddress1",
+          "ShipToCity=@ShipToCity",
+          "ShipToState=@ShipToState",
+          "ShipToZip=@ShipToZip",
+        ].filter(Boolean).join(", ");
+
+        const colList = [
+          "OrderItemID","OrderId","CustomerID","CustomerName",
+          ...(cols.hasItemID ? ["ItemID"] : []),
+          ...(cols.hasSKU    ? ["SKU"]    : []),
+          "UnitID","UnitName","Qualifier","OrderedQTY","ReferenceNum",
+          "ShipToAddress1","ShipToCity","ShipToState","ShipToZip",
+        ];
+
+        const valList = colList.map(c => `@${c}`).join(", ");
+
+        await req.query(`
 IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
-  UPDATE dbo.OrderDetails
-     SET OrderId=@OrderId,
-         CustomerID=@CustomerID,
-         CustomerName=@CustomerName,
-         ItemID=@ItemID,
-         UnitID=@UnitID,
-         UnitName=@UnitName,
-         Qualifier=@Qualifier,
-         OrderedQTY=@OrderedQTY,
-         ReferenceNum=@ReferenceNum,
-         ShipToAddress1=@ShipToAddress1,
-         ShipToCity=@ShipToCity,
-         ShipToState=@ShipToState,
-         ShipToZip=@ShipToZip
-   WHERE OrderItemID=@OrderItemID;
+  UPDATE dbo.OrderDetails SET ${setPieces} WHERE OrderItemID=@OrderItemID;
 ELSE
-  INSERT INTO dbo.OrderDetails
-    (OrderItemID, OrderId, CustomerID, CustomerName, ItemID, UnitID, UnitName, Qualifier, OrderedQTY, ReferenceNum, ShipToAddress1, ShipToCity, ShipToState, ShipToZip)
-  VALUES
-    (@OrderItemID, @OrderId, @CustomerID, @CustomerName, @ItemID, @UnitID, @UnitName, @Qualifier, @OrderedQTY, @ReferenceNum, @ShipToAddress1, @ShipToCity, @ShipToState, @ShipToZip);
+  INSERT INTO dbo.OrderDetails (${colList.join(", ")})
+  VALUES (${valList});
         `);
+
         upsertedItems++;
       } catch (e) {
         errors.push({
@@ -327,7 +329,7 @@ ELSE
       }
     }
 
-    if (orders.length < pageSize) break; // last page
+    if (orders.length < pageSize) break;
   }
 
   return errors.length
