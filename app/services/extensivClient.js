@@ -1,12 +1,38 @@
 // src/app/services/extensivClient.js
 import axios from "axios";
+import { getPool, sql } from "./db/mssql.js";
 
-/* ------------------------ shared helpers / auth ------------------------ */
-
+/* ===================== small helpers ===================== */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
-const BASE =
-  trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+const safeStr = (v, max) =>
+  v == null ? null : String(v).normalize("NFC").slice(0, max);
+const toInt = (v, def = 0) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.trunc(n);
+};
 
+function firstArray(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.ResourceList)) return obj.ResourceList;
+  const hal = obj?._embedded?.["http://api.3plCentral.com/rels/orders/order"];
+  if (Array.isArray(hal)) return hal;
+  if (Array.isArray(obj?.data)) return obj.data;
+  for (const v of Object.values(obj || {})) if (Array.isArray(v)) return v;
+  return [];
+}
+function readOnly(o) { return o?.readOnly || o?.ReadOnly || {}; }
+function itemsFromOrder(ord) {
+  const em = ord?._embedded;
+  if (em && Array.isArray(em["http://api.3plCentral.com/rels/orders/item"])) {
+    return em["http://api.3plCentral.com/rels/orders/item"];
+  }
+  if (Array.isArray(ord?.OrderItems)) return ord.OrderItems;
+  if (Array.isArray(ord?.Items)) return ord.Items;
+  return [];
+}
+
+/* ===================== auth (basic or oauth) ===================== */
 function basicHeaderFromEnv() {
   const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
   return b64 ? `Basic ${b64}` : null;
@@ -15,13 +41,12 @@ function basicHeaderFromEnv() {
 async function getBearerViaOAuth() {
   const tokenUrl = process.env.EXT_TOKEN_URL;
   if (!tokenUrl) return null;
-
   try {
     const form = new URLSearchParams();
     form.set("grant_type", "client_credentials");
-    if (process.env.EXT_USER_LOGIN) form.set("user_login", process.env.EXT_USER_LOGIN);
-    if (process.env.EXT_USER_LOGIN_ID) form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
-    if (process.env.EXT_TPL_GUID) form.set("tplguid", process.env.EXT_TPL_GUID);
+    if (process.env.EXT_USER_LOGIN)     form.set("user_login",    process.env.EXT_USER_LOGIN);
+    if (process.env.EXT_USER_LOGIN_ID)  form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
+    if (process.env.EXT_TPL_GUID)       form.set("tplguid",       process.env.EXT_TPL_GUID);
 
     const auth = basicHeaderFromEnv(); // base64(clientId:clientSecret)
     const resp = await axios.post(tokenUrl, form, {
@@ -33,7 +58,6 @@ async function getBearerViaOAuth() {
       timeout: 15000,
       validateStatus: () => true,
     });
-
     if (resp.status >= 200 && resp.status < 300 && resp.data?.access_token) {
       return `Bearer ${resp.data.access_token}`;
     }
@@ -45,7 +69,7 @@ async function getBearerViaOAuth() {
 
 export async function authHeaders() {
   const mode = (process.env.EXT_AUTH_MODE || "").toLowerCase();
-  if (mode === "bearer" || process.env.EXT_TOKEN_URL) {
+  if (mode === "bearer") {
     const bearer = await getBearerViaOAuth();
     if (bearer) {
       return {
@@ -66,193 +90,228 @@ export async function authHeaders() {
   };
 }
 
-/* ---------------------------- order + inv API --------------------------- */
-
-export async function getOrderWithItems(orderId) {
-  const headers = await authHeaders();
-  const { data } = await axios.get(`${BASE}/orders/${orderId}`, {
+/* ===================== API calls ===================== */
+async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1 }) {
+  const { data } = await axios.get(`${base}/orders`, {
     headers,
-    params: { detail: "All", itemdetail: "All" },
-    timeout: 20000,
+    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
+    timeout: 30000,
   });
   return data;
 }
 
-export function extractOrderItems(order) {
-  const em = order?._embedded;
-  if (em && Array.isArray(em["http://api.3plcentral.com/rels/orders/item"])) {
-    return em["http://api.3plcentral.com/rels/orders/item"];
-  }
-  return [];
-}
-
-// Receive-level inventory with receiveItemId for a single SKU (optionally filter by facility)
-export async function getReceiveInventoryBySku({ sku, facilityId, pageSize = 1000 }) {
-  const headers = await authHeaders();
-  const rql = facilityId
-    ? `itemIdentifier.sku==${sku};facilityIdentifier.id==${facilityId}`
-    : `itemIdentifier.sku==${sku}`;
-
-  const { data } = await axios.get(`${BASE}/inventory`, {
-    headers,
-    params: { pgsiz: pageSize, pgnum: 1, rql },
-    timeout: 20000,
-  });
-
-  const list = data?._embedded?.item;
-  return Array.isArray(list) ? list : [];
-}
-
-/* ------------------------------ allocator -------------------------------- */
-
-function planForOneItem({ needQty, invRows }) {
-  const sorted = [...invRows].sort((a, b) => {
-    const da = new Date(a.receivedDate).getTime() || 0;
-    const db = new Date(b.receivedDate).getTime() || 0;
-    return da - db; // FIFO
-  });
-
-  const chunks = [];
-  let remaining = Number(needQty) || 0;
-
-  for (const row of sorted) {
-    if (remaining <= 0) break;
-    const avail = Math.max(0, Number(row.availableQty) || 0);
-    if (!avail) continue;
-
-    const take = Math.min(remaining, avail);
-    chunks.push({ receiveItemId: row.receiveItemId, qty: take });
-    remaining -= take;
-  }
-  return { chunks, remaining };
-}
-
-export async function buildAllocationPlan(order) {
-  const orderId =
-    order?.readOnly?.orderId ?? order?.ReadOnly?.OrderId ?? order?.orderId ?? null;
-  const facilityId =
-    order?.readOnly?.facilityIdentifier?.id ??
-    order?.ReadOnly?.FacilityIdentifier?.Id ??
-    null;
-
-  const items = extractOrderItems(order);
-
-  const plan = [];
-  const debug = [];
-
-  for (const it of items) {
-    const orderItemId =
-      it?.readOnly?.orderItemId ?? it?.ReadOnly?.OrderItemId ?? it?.orderItemId;
-    const sku =
-      it?.itemIdentifier?.sku ??
-      it?.ItemIdentifier?.Sku ??
-      it?.sku;
-    const already = Array.isArray(it?.readOnly?.allocations) ? it.readOnly.allocations : [];
-    const alreadyQty = already.reduce((s, a) => s + (Number(a?.qty) || 0), 0);
-    const needQty = Math.max(0, (Number(it?.qty) || 0) - alreadyQty);
-
-    if (!orderItemId || !sku || needQty <= 0) {
-      debug.push({ orderItemId, sku, skipped: true, reason: "no need or missing ids", needQty });
-      continue;
-    }
-
-    const inv = await getReceiveInventoryBySku({ sku, facilityId });
-    const availableRows = inv.filter(r => (Number(r.availableQty) || 0) > 0);
-
-    const { chunks, remaining } = planForOneItem({ needQty, invRows: availableRows });
-
-    debug.push({
-      orderItemId,
-      sku,
-      needQty,
-      availableBins: availableRows.length,
-      plannedBins: chunks.length,
-      remaining,
-    });
-
-    if (chunks.length) {
-      plan.push({ orderItemId, proposedAllocations: chunks });
-    }
-  }
-
-  return { orderId, plan, debug };
-}
-
-export async function postAllocation(orderId, plan) {
-  const headers = await authHeaders();
-  const url = `${BASE}/orders/${orderId}/allocator`;
-  const body = { proposedAllocations: plan };
-
-  const resp = await axios.post(url, body, {
-    headers,
-    timeout: 20000,
-    validateStatus: () => true,
-  });
-
-  return { status: resp.status, data: resp.data };
-}
-
-/* ------------------------------ 1-shot API ------------------------------ */
-
-export async function allocateOrderById(orderId) {
-  const order = await getOrderWithItems(orderId);
-  const { plan, debug } = await buildAllocationPlan(order);
-
-  if (!plan.length) {
-    return { ok: false, posted: false, reason: "Nothing to allocate", debug };
-  }
-
-  const post = await postAllocation(orderId, plan);
-  const ok = post.status >= 200 && post.status < 300;
-
-  return {
-    ok,
-    posted: true,
-    status: post.status,
-    response: post.data,
-    summary: {
-      orderId,
-      itemsPlanned: plan.length,
-      totalChunks: plan.reduce((s, p) => s + p.proposedAllocations.length, 0),
-      totalQty: plan
-        .flatMap(p => p.proposedAllocations)
-        .reduce((s, c) => s + (Number(c.qty) || 0), 0),
-    },
-    debug,
-    postedPayload: { proposedAllocations: plan },
-  };
-}
-// --- Back-compat shims for routes that still import these ---
-
 export async function fetchOneOrderDetail(orderId) {
-  // just reuse the new single-order getter
-  return await getOrderWithItems(orderId);
-}
-
-export async function fetchAndUpsertOrders({ pgsiz = 100, pgnum = 1 } = {}) {
-  // Lightweight importer that DOES NOT write to SQL (avoids your NOT NULL issues).
-  // It returns counts so your UI doesn't break.
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const headers = await authHeaders();
-  const { data } = await axios.get(`${BASE}/orders`, {
-    headers,
-    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
-    timeout: 20000,
-  });
 
-  // Normalize to a list
-  const list =
-    Array.isArray(data?._embedded?.["http://api.3plcentral.com/rels/orders/order"])
-      ? data._embedded["http://api.3plcentral.com/rels/orders/order"]
-      : Array.isArray(data?.ResourceList)
-      ? data.ResourceList
-      : Array.isArray(data)
-      ? data
-      : [];
+  // Try RQL filtered single order (with item details)
+  try {
+    const { data } = await axios.get(`${base}/orders`, {
+      headers,
+      params: { pgsiz: 1, pgnum: 1, detail: "OrderItems", itemdetail: "All", rql: `readOnly.orderId==${orderId}` },
+      timeout: 20000,
+    });
+    const list = firstArray(data);
+    if (list?.[0]) return list[0];
+  } catch { /* ignore */ }
 
-  return {
-    importedHeaders: list.length,
-    upsertedItems: 0,
-    ok: true,
-    note: "Importer temporarily returns counts only. No SQL writes to avoid schema constraints.",
-  };
+  // Fallback: page 1 then find it
+  try {
+    const page = await listOrdersPage({ base, headers, pgsiz: 100, pgnum: 1 });
+    const list = firstArray(page);
+    return list.find(o => (readOnly(o).OrderId ?? o.OrderId ?? o.orderId) === orderId) || null;
+  } catch {
+    return null;
+  }
 }
+
+/* ===================== DB bootstrap ===================== */
+async function ensureTables(pool) {
+  await pool.request().batch(`
+IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
+  CREATE TABLE dbo.OrderDetails (
+    OrderItemID INT NOT NULL PRIMARY KEY,
+    OrderId     INT NULL,
+    ItemID      VARCHAR(150) NULL,
+    Qualifier   VARCHAR(80) NULL,
+    OrderedQTY  INT NULL
+  );
+
+-- widen if an older, narrower version exists
+IF COL_LENGTH('dbo.OrderDetails','ItemID')    IS NOT NULL AND COL_LENGTH('dbo.OrderDetails','ItemID')    < 150
+  ALTER TABLE dbo.OrderDetails ALTER COLUMN ItemID   VARCHAR(150) NULL;
+IF COL_LENGTH('dbo.OrderDetails','Qualifier') IS NOT NULL AND COL_LENGTH('dbo.OrderDetails','Qualifier') < 80
+  ALTER TABLE dbo.OrderDetails ALTER COLUMN Qualifier VARCHAR(80) NULL;
+`);
+}
+
+/* ============== detail fetcher (only if items are missing) ============== */
+async function fetchDetailsForMany(orderIds, headers, base, concurrency = 4) {
+  const results = [];
+  let idx = 0;
+  async function worker() {
+    while (idx < orderIds.length) {
+      const id = orderIds[idx++];
+      try {
+        const { data } = await axios.get(`${base}/orders`, {
+          headers,
+          params: { pgsiz: 1, pgnum: 1, detail: "OrderItems", itemdetail: "All", rql: `readOnly.orderId==${id}` },
+          timeout: 20000,
+        });
+        const list = firstArray(data);
+        if (list?.[0]) results.push(list[0]);
+      } catch { /* ignore one-off */ }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, orderIds.length) }, worker));
+  return results;
+}
+
+/* ===================== MAIN IMPORT (robust) ===================== */
+export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {}) {
+  const pool = await getPool();
+  await ensureTables(pool);
+
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
+
+  let importedHeaders = 0;
+  let upsertedItems   = 0;
+  const errors        = [];
+
+  for (let pg = 1; pg <= maxPages; pg++) {
+    let pageData;
+    try {
+      pageData = await listOrdersPage({ base, headers, pgsiz: pageSize, pgnum: pg });
+    } catch (e) {
+      const st = e.response?.status;
+      const dt = e.response?.data;
+      return {
+        ok: false,
+        status: st || 500,
+        message: `Orders GET failed (page ${pg})`,
+        data: typeof dt === "string" ? dt : dt || String(e.message),
+      };
+    }
+
+    const orders = firstArray(pageData);
+    if (!orders.length) break;
+    importedHeaders += orders.length;
+
+    // flatten items from page
+    const flat = [];
+    const orderIds = [];
+
+    for (const ord of orders) {
+      const ro = readOnly(ord);
+      const orderId = ro.OrderId ?? ro.orderId ?? ord.OrderId ?? ord.orderId ?? null;
+      if (orderId) orderIds.push(orderId);
+
+      for (const it of itemsFromOrder(ord)) {
+        const iro = readOnly(it);
+        const orderItemId =
+          iro.OrderItemId ?? iro.orderItemId ?? it.orderItemId ?? it.OrderItemId ?? it.id ?? null;
+
+        let sku =
+          it?.itemIdentifier?.sku ??
+          it?.ItemIdentifier?.Sku ??
+          it?.sku ??
+          it?.SKU ??
+          null;
+
+        let qualifier = it?.qualifier ?? it?.Qualifier ?? "";
+        const qty     = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
+
+        if (orderItemId && sku) {
+          flat.push({
+            orderItemId: toInt(orderItemId, null),
+            orderId:     toInt(orderId, null),
+            sku:         safeStr(sku, 150),
+            qualifier:   safeStr(qualifier, 80) || "",
+            qty,
+          });
+        }
+      }
+    }
+
+    // If no items came back, fetch details per order
+    if (flat.length === 0 && orderIds.length) {
+      const detailed = await fetchDetailsForMany(orderIds, headers, base, 4);
+      for (const ord of detailed) {
+        const ro = readOnly(ord);
+        const orderId = ro.OrderId ?? ro.orderId ?? ord.OrderId ?? ord.orderId ?? null;
+
+        for (const it of itemsFromOrder(ord)) {
+          const iro = readOnly(it);
+          const orderItemId =
+            iro.OrderItemId ?? iro.orderItemId ?? it.orderItemId ?? it.OrderItemId ?? it.id ?? null;
+
+          let sku =
+            it?.itemIdentifier?.sku ??
+            it?.ItemIdentifier?.Sku ??
+            it?.sku ??
+            it?.SKU ??
+            null;
+
+          let qualifier = it?.qualifier ?? it?.Qualifier ?? "";
+          const qty     = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
+
+          if (orderItemId && sku) {
+            flat.push({
+              orderItemId: toInt(orderItemId, null),
+              orderId:     toInt(orderId, null),
+              sku:         safeStr(sku, 150),
+              qualifier:   safeStr(qualifier, 80) || "",
+              qty,
+            });
+          }
+        }
+      }
+    }
+
+    // de-dupe by OrderItemID
+    const byId = new Map();
+    for (const x of flat) if (!byId.has(x.orderItemId)) byId.set(x.orderItemId, x);
+    const items = Array.from(byId.values());
+
+    // **no transaction**; insert row-by-row so one bad row doesn’t abort the batch
+    for (const it of items) {
+      try {
+        await pool.request()
+          .input("OrderItemID", sql.Int, it.orderItemId)
+          .input("OrderId",     sql.Int, it.orderId ?? null)
+          .input("ItemID",      sql.VarChar(150), it.sku)
+          .input("Qualifier",   sql.VarChar(80),  it.qualifier)
+          .input("OrderedQTY",  sql.Int, it.qty)
+          .query(`
+IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
+  UPDATE dbo.OrderDetails
+     SET OrderId=@OrderId, ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQTY
+   WHERE OrderItemID=@OrderItemID;
+ELSE
+  INSERT INTO dbo.OrderDetails (OrderItemID, OrderId, ItemID, Qualifier, OrderedQTY)
+  VALUES (@OrderItemID, @OrderId, @ItemID, @Qualifier, @OrderedQTY);
+        `);
+        upsertedItems++;
+      } catch (e) {
+        // capture full details for debugging
+        errors.push({
+          orderItemId: it.orderItemId,
+          message: e.message,
+          number: e.number,
+          code: e.code,
+          state: e.state,
+          class: e.class,
+          lineNumber: e.lineNumber,
+        });
+      }
+    }
+
+    if (orders.length < pageSize) break; // last page
+  }
+
+  return errors.length
+    ? { ok: false, importedHeaders, upsertedItems, errors }
+    : { ok: true, importedHeaders, upsertedItems };
+}
+
