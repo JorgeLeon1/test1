@@ -4,6 +4,32 @@ import axios from "axios";
 import { fetchAndUpsertOrders, authHeaders } from "../services/extensivClient.js";
 import { runAllocationAndRead } from "../services/allocService.js";
 import { pushAllocations } from "../services/pushAllocations.js";
+import { importInventory } from "../services/inventoryClient.js";
+
+r.post('/inventory-import', async (_req, res, next) => {
+  try { res.json(await importInventory()); }
+  catch (e) { next(e); }
+});
+
+// optional quick DB/API probe if you want it:
+import { getPool } from "../services/db/mssql.js";
+r.get('/selftest', async (_req, res) => {
+  try {
+    const headers = await authHeaders();
+    const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || 'https://box.secure-wms.com').replace(/\/+$/,'');
+    const invResp = await axios.get(`${base}/orders`, { headers, timeout: 15000 });
+    const count = Array.isArray(invResp.data?.ResourceList) ? invResp.data.ResourceList.length : 0;
+
+    const pool = await getPool();
+    await pool.request().query('SELECT 1');
+
+    res.json({ ok:true, ordersCount: count });
+  } catch (e) {
+    res.status(500).json({ ok:false, status:e.response?.status, message:e.message, data:e.response?.data });
+  }
+});
+
+
 
 const r = Router();
 const baseUrl = () =>
