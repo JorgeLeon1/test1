@@ -1,336 +1,246 @@
-// app/services/extensivClient.js
+// src/app/services/extensivClient.js
 import axios from "axios";
-import { getPool, sql } from "../../db/mssql.js";
+import { getPool, sql } from "./db/mssql.js";
 
-const TIMEOUT = 30000;
+/* --------------------------- auth helpers --------------------------- */
 
-/** ---------- TOKEN (Bearer) OR BASIC ---------- **/
-let tokenCache = { value: null, exp: 0 };
+const trimBase = (u) => (u || "").replace(/\/+$/, "");
 
-function b64() {
-  // prefer explicit base64 if provided
-  if (process.env.EXT_BASIC_AUTH_B64) return process.env.EXT_BASIC_AUTH_B64.trim();
-  const id = process.env.EXT_CLIENT_ID || process.env.EXT_API_KEY || "";
-  const sec = process.env.EXT_CLIENT_SECRET || process.env.EXT_API_SECRET || "";
-  return Buffer.from(`${id}:${sec}`).toString("base64");
+function basicHeaderFromEnv() {
+  const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
+  return b64 ? `Basic ${b64}` : null;
 }
 
-function trimBase(u) { return (u || "").replace(/\/+$/, ""); }
+async function getBearerViaOAuth() {
+  // Only try if you actually have a token URL configured
+  const tokenUrl = process.env.EXT_TOKEN_URL;
+  if (!tokenUrl) return null;
 
-async function fetchOAuthToken() {
-  if (Date.now() < tokenCache.exp && tokenCache.value) return tokenCache.value;
+  try {
+    const form = new URLSearchParams();
+    form.set("grant_type", "client_credentials");
+    if (process.env.EXT_USER_LOGIN) form.set("user_login", process.env.EXT_USER_LOGIN);
+    if (process.env.EXT_USER_LOGIN_ID) form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
+    if (process.env.EXT_TPL_GUID) form.set("tplguid", process.env.EXT_TPL_GUID);
 
-  const tokenUrl = process.env.EXT_TOKEN_URL
-    || "https://secure-wms.com/AuthServer/api/Token"; // sandbox default
-
-  // Extensiv oauth likes x-www-form-urlencoded with Basic auth header
-  const form = new URLSearchParams();
-  form.set("grant_type", "client_credentials");
-  if (process.env.EXT_USER_LOGIN) form.set("user_login", process.env.EXT_USER_LOGIN);
-
-  const r = await axios.post(tokenUrl, form.toString(), {
-    headers: {
-      Authorization: `Basic ${b64()}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
-    timeout: TIMEOUT,
-    validateStatus: () => true,
-  });
-
-  if (r.status >= 400) {
-    const err = new Error(`OAuth ${r.status}`);
-    err.response = r;
-    throw err;
-  }
-
-  const tok = r.data?.access_token || r.data?.token || r.data?.accessToken;
-  const expSec = Number(r.data?.expires_in || 300);
-  if (!tok) throw new Error("Token response missing access_token");
-  tokenCache = { value: tok, exp: Date.now() + (expSec - 30) * 1000 };
-  return tok;
-}
-
-export async function authHeaders() {
-  const mode = (process.env.EXT_AUTH_MODE || "bearer").toLowerCase();
-  if (mode === "basic") {
-    return {
-      Authorization: `Basic ${b64()}`,
-      Accept: "application/hal+json; charset=utf-8",
-      "Content-Type": "application/hal+json; charset=utf-8",
-    };
-  } else {
-    const tok = await fetchOAuthToken();
-    return {
-      Authorization: `Bearer ${tok}`,
-      Accept: "application/hal+json; charset=utf-8",
-      "Content-Type": "application/hal+json; charset=utf-8",
-    };
-  }
-}
-
-/** ---------- HELPERS: HAL vs ResourceList ---------- **/
-function get(obj, ...keys) {
-  for (const k of keys) {
-    if (obj && k in obj) { obj = obj[k]; } else { return undefined; }
-  }
-  return obj;
-}
-
-function pickOrderArray(payload) {
-  // HAL shape
-  const halKey = "http://api.3plCentral.com/rels/orders/order";
-  const fromHal = get(payload, "_embedded", halKey);
-  if (Array.isArray(fromHal)) return { list: fromHal, mode: "hal" };
-
-  // Legacy non-HAL
-  const rl = payload?.ResourceList;
-  if (Array.isArray(rl)) return { list: rl, mode: "resourcelist" };
-
-  // Some tenants return plain arrays
-  if (Array.isArray(payload)) return { list: payload, mode: "array" };
-
-  return { list: [], mode: "unknown" };
-}
-
-function mapHeader(o) {
-  // Support HAL (camel) and non-HAL (Pascal) casings
-  const ro = o.readOnly || o.ReadOnly || {};
-  const cust = ro.customerIdentifier || ro.CustomerIdentifier || {};
-  const fac = ro.facilityIdentifier || ro.FacilityIdentifier || {};
-  return {
-    OrderId: ro.orderId ?? ro.OrderId ?? o.orderId ?? o.OrderId,
-    ReferenceNum: o.referenceNum ?? o.ReferenceNum ?? null,
-    CustomerId: cust.id ?? cust.Id ?? null,
-    FacilityId: fac.id ?? fac.Id ?? null,
-    Status: ro.status ?? ro.Status ?? null,
-    ProcessDate: ro.processDate ?? ro.ProcessDate ?? null,
-    LastModifiedDate: ro.lastModifiedDate ?? ro.LastModifiedDate ?? null,
-  };
-}
-
-function mapItems(o) {
-  // HAL items live in _embedded[rels/orders/item]
-  const halItemKey = "http://api.3plCentral.com/rels/orders/item";
-  let items = get(o, "_embedded", halItemKey);
-  if (!Array.isArray(items)) {
-    // Some legacy payloads flatten items
-    items = o.OrderItems || o.orderItems || [];
-  }
-
-  const orderId =
-    o.readOnly?.orderId ?? o.ReadOnly?.OrderId ?? o.orderId ?? o.OrderId;
-
-  return items.map((it) => {
-    const ro = it.readOnly || it.ReadOnly || {};
-    const itemId = ro.orderItemId ?? ro.OrderItemId ?? it.orderItemId ?? it.OrderItemId;
-    const ident = it.itemIdentifier || it.ItemIdentifier || {};
-    return {
-      OrderItemId: itemId,
-      OrderId: orderId,
-      SKU: ident.sku ?? ident.Sku ?? it.sku ?? it.Sku ?? null,
-      Qualifier: it.qualifier ?? it.Qualifier ?? null,
-      Qty: it.qty ?? it.Qty ?? it.orderedQty ?? it.OrderedQty ?? 0,
-    };
-  });
-}
-
-/** ---------- SQL: ensure tables & upserts ---------- **/
-async function ensureTables(pool) {
-  // OrderHeaders
-  await pool.request().batch(`
-IF OBJECT_ID('dbo.OrderHeaders','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.OrderHeaders (
-    OrderId            INT          NOT NULL PRIMARY KEY,
-    ReferenceNum       NVARCHAR(200) NULL,
-    CustomerId         INT           NULL,
-    FacilityId         INT           NULL,
-    Status             INT           NULL,
-    ProcessDate        DATETIME2     NULL,
-    LastModifiedDate   DATETIME2     NULL
-  );
-END
-`);
-  // OrderDetails
-  await pool.request().batch(`
-IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
-BEGIN
-  CREATE TABLE dbo.OrderDetails (
-    OrderItemId    INT           NOT NULL PRIMARY KEY,
-    OrderId        INT           NOT NULL,
-    ItemID         NVARCHAR(200) NULL,  -- alias for SKU to match your earlier naming
-    SKU            NVARCHAR(200) NULL,
-    Qualifier      NVARCHAR(50)  NULL,
-    OrderedQTY     DECIMAL(18,4) NULL,
-    CONSTRAINT FK_OrderDetails_OrderHeaders FOREIGN KEY (OrderId) REFERENCES dbo.OrderHeaders(OrderId)
-  );
-END
-`);
-}
-
-async function upsertHeaderTx(tx, h) {
-  const r = new sql.Request(tx);
-  await r
-    .input("OrderId", sql.Int, h.OrderId)
-    .input("ReferenceNum", sql.NVarChar(200), h.ReferenceNum)
-    .input("CustomerId", sql.Int, h.CustomerId)
-    .input("FacilityId", sql.Int, h.FacilityId)
-    .input("Status", sql.Int, h.Status)
-    .input("ProcessDate", sql.DateTime2, h.ProcessDate ? new Date(h.ProcessDate) : null)
-    .input("LastModifiedDate", sql.DateTime2, h.LastModifiedDate ? new Date(h.LastModifiedDate) : null)
-    .query(`
-MERGE dbo.OrderHeaders AS t
-USING (SELECT @OrderId AS OrderId) s
-ON (t.OrderId = s.OrderId)
-WHEN MATCHED THEN UPDATE SET
-  ReferenceNum=@ReferenceNum, CustomerId=@CustomerId, FacilityId=@FacilityId,
-  Status=@Status, ProcessDate=@ProcessDate, LastModifiedDate=@LastModifiedDate
-WHEN NOT MATCHED THEN INSERT (OrderId, ReferenceNum, CustomerId, FacilityId, Status, ProcessDate, LastModifiedDate)
-VALUES (@OrderId, @ReferenceNum, @CustomerId, @FacilityId, @Status, @ProcessDate, @LastModifiedDate);
-`);
-}
-
-async function upsertItemTx(tx, it) {
-  const r = new sql.Request(tx);
-  await r
-    .input("OrderItemId", sql.Int, it.OrderItemId)
-    .input("OrderId", sql.Int, it.OrderId)
-    .input("SKU", sql.NVarChar(200), it.SKU)
-    .input("Qualifier", sql.NVarChar(50), it.Qualifier || "")
-    .input("Qty", sql.Decimal(18,4), Number(it.Qty || 0))
-    .query(`
-MERGE dbo.OrderDetails AS t
-USING (SELECT @OrderItemId AS OrderItemId) s
-ON (t.OrderItemId = s.OrderItemId)
-WHEN MATCHED THEN UPDATE SET
-  OrderId=@OrderId, SKU=@SKU, ItemID=@SKU, Qualifier=@Qualifier, OrderedQTY=@Qty
-WHEN NOT MATCHED THEN INSERT (OrderItemId, OrderId, SKU, ItemID, Qualifier, OrderedQTY)
-VALUES (@OrderItemId, @OrderId, @SKU, @SKU, @Qualifier, @Qty);
-`);
-}
-
-/** ---------- PUBLIC: import headers+items with detail ---------- **/
-export async function fetchAndUpsertOrders({ startPage = 1, limit = 200, pgsiz = 100 } = {}) {
-  const api = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
-  const baseUrl = `${api}/orders`; // HAL endpoint
-
-  const pool = await getPool();
-  await ensureTables(pool);
-
-  let page = startPage;
-  let importedHeaders = 0;
-  let upsertedItems = 0;
-
-  const commonHeaders = await authHeaders();
-
-  while (importedHeaders < limit) {
-    const params = {
-      pgsiz: Math.min(Math.max(1, pgsiz), 1000),
-      pgnum: page,
-      detail: "OrderItems",          // include items
-      itemdetail: "All",             // include allocations + saved elements
-      // Optional RQL, e.g., status filters or modified date:
-      // rql: "ReadOnly.IsClosed==false"
-    };
-
-    const resp = await axios.get(baseUrl, {
-      headers: { ...commonHeaders, "Accept-Language": "en-US,en;q=0.8" },
-      params,
-      timeout: TIMEOUT,
+    const auth = basicHeaderFromEnv(); // base64(clientId:clientSecret)
+    const resp = await axios.post(tokenUrl, form, {
+      headers: {
+        Authorization: auth || "",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      timeout: 15000,
       validateStatus: () => true,
     });
 
-    if (resp.status === 400 && String(resp.data?.ErrorCode || "").includes("NotSupported")) {
-      // Some tenants are picky—fall back to just pgsiz/pgnum without detail flags
-      delete params.itemdetail;
-      delete params.detail;
-      const resp2 = await axios.get(baseUrl, {
-        headers: { ...commonHeaders, "Accept-Language": "en-US,en;q=0.8" },
-        params,
-        timeout: TIMEOUT,
-        validateStatus: () => true,
-      });
-      if (resp2.status >= 400) {
-        const e = new Error(`Orders ${resp2.status}`);
-        e.response = resp2;
-        throw e;
-      }
-      await upsertPayload(pool, resp2.data, { includeItems: false });
-      const { countH } = countPayload(resp2.data, false);
-      importedHeaders += countH;
-      if (countH === 0) break;
-      page++;
-      continue;
+    if (resp.status >= 200 && resp.status < 300 && resp.data?.access_token) {
+      return `Bearer ${resp.data.access_token}`;
     }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-    if (resp.status >= 400) {
-      const e = new Error(`Orders ${resp.status}`);
-      e.response = resp;
+export async function authHeaders() {
+  // Preferred order: explicit AUTH_MODE, else try OAuth, else Basic
+  const mode = (process.env.EXT_AUTH_MODE || "").toLowerCase();
+  if (mode === "bearer") {
+    const bearer = await getBearerViaOAuth();
+    if (bearer) {
+      return {
+        Authorization: bearer,
+        Accept: "application/hal+json, application/json",
+        "Content-Type": "application/hal+json; charset=utf-8",
+      };
+    }
+    // fall back to basic
+  }
+
+  const basic = basicHeaderFromEnv();
+  if (!basic) {
+    throw new Error("No auth configured: set EXT_BASIC_AUTH_B64 or EXT_TOKEN_URL (+ client id/secret).");
+  }
+  return {
+    Authorization: basic,
+    Accept: "application/hal+json, application/json",
+    "Content-Type": "application/hal+json; charset=utf-8",
+  };
+}
+
+/* --------------------------- API primitives -------------------------- */
+
+function firstArray(obj) {
+  if (Array.isArray(obj)) return obj;
+  if (Array.isArray(obj?.ResourceList)) return obj.ResourceList;
+  if (Array.isArray(obj?._embedded?.["http://api.3plCentral.com/rels/orders/order"])) {
+    return obj._embedded["http://api.3plCentral.com/rels/orders/order"];
+  }
+  if (Array.isArray(obj?.data)) return obj.data;
+  for (const v of Object.values(obj || {})) if (Array.isArray(v)) return v;
+  return [];
+}
+
+function extractOrderItems(order) {
+  // Try the common HAL spot first
+  const em = order?._embedded;
+  if (em && Array.isArray(em["http://api.3plCentral.com/rels/orders/item"])) {
+    return em["http://api.3plCentral.com/rels/orders/item"];
+  }
+  // Try other shapes we’ve seen in the wild
+  if (Array.isArray(order?.OrderItems)) return order.OrderItems;
+  if (Array.isArray(order?.Items)) return order.Items;
+  // Nothing found
+  return [];
+}
+
+/* 
+  Legacy listing endpoint:
+  GET https://box.secure-wms.com/orders?pgsiz=100&pgnum=1&detail=OrderItems&itemdetail=All
+*/
+async function legacyListOrders({ pgsiz = 100, pgnum = 1 } = {}) {
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
+
+  const resp = await axios.get(`${base}/orders`, {
+    headers,
+    params: {
+      pgsiz,
+      pgnum,
+      // include items so we can upsert details in one pass
+      detail: "OrderItems",
+      itemdetail: "All",
+    },
+    timeout: 30000,
+  });
+  return resp.data;
+}
+
+/* 
+  Fetch a *single* order with items (fallback endpoint)
+  Some tenants expose a detail endpoint; if you don’t have it, we’ll just filter from list.
+*/
+export async function fetchOneOrderDetail(orderId) {
+  // safest: list with RQL to limit to a single order id (if your tenant supports rql=readOnly.orderId==ID)
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
+
+  // Try RQL filter (many tenants support `rql=readOnly.orderId==<id>`)
+  try {
+    const { data } = await axios.get(`${base}/orders`, {
+      headers,
+      params: { pgsiz: 1, pgnum: 1, detail: "OrderItems", itemdetail: "All", rql: `readOnly.orderId==${orderId}` },
+      timeout: 20000,
+    });
+    const list = firstArray(data);
+    return list[0] || null;
+  } catch {
+    // Fallback: fetch a page and find it (not ideal, but keeps the function safe)
+    const page = await legacyListOrders({ pgsiz: 100, pgnum: 1 });
+    const list = firstArray(page);
+    return list.find(o => o?.ReadOnly?.OrderId === orderId) || null;
+  }
+}
+
+/* ------------------------------ DB setup ------------------------------ */
+
+async function ensureTables(pool) {
+  await pool.request().batch(`
+IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
+  CREATE TABLE dbo.OrderDetails (
+    OrderItemID INT NULL,
+    OrderId     INT NULL,
+    ItemID      VARCHAR(100) NULL,
+    Qualifier   VARCHAR(50) NULL,
+    OrderedQTY  INT NULL
+  );
+`);
+}
+
+/* ----------------------------- Main import ---------------------------- */
+
+export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 100 } = {}) {
+  const pool = await getPool();
+  await ensureTables(pool);
+
+  let importedHeaders = 0;
+  let upsertedItems = 0;
+
+  for (let page = 1; page <= maxPages; page++) {
+    const payload = await legacyListOrders({ pgsiz: pageSize, pgnum: page });
+    const orders = firstArray(payload);
+    if (!orders.length) break;
+
+    importedHeaders += orders.length;
+
+    const tx = new sql.Transaction(pool);
+    await tx.begin();
+    try {
+      const req = new sql.Request(tx);
+
+      for (const ord of orders) {
+        const orderId =
+          ord?.ReadOnly?.OrderId ??
+          ord?.readOnly?.orderId ??
+          ord?.orderId ??
+          null;
+
+        const items = extractOrderItems(ord);
+        for (const it of items) {
+          const orderItemId =
+            it?.ReadOnly?.OrderItemId ??
+            it?.readOnly?.orderItemId ??
+            it?.orderItemId ??
+            it?.id ??
+            null;
+
+          const sku =
+            it?.ItemIdentifier?.Sku ??
+            it?.itemIdentifier?.sku ??
+            it?.sku ??
+            null;
+
+          const qualifier = it?.Qualifier ?? it?.qualifier ?? "";
+          const qty =
+            Number(
+              it?.Qty ??
+              it?.qty ??
+              it?.OrderedQty ??
+              it?.orderedQty ??
+              0
+            ) || 0;
+
+          if (orderItemId && sku) {
+            await req
+              .input("OrderItemID", sql.Int, orderItemId)
+              .input("OrderId", sql.Int, orderId)
+              .input("ItemID", sql.VarChar(100), sku)
+              .input("Qualifier", sql.VarChar(50), qualifier)
+              .input("OrderedQTY", sql.Int, qty)
+              .query(`
+                MERGE dbo.OrderDetails AS t
+                USING (SELECT @OrderItemID AS OrderItemID) s
+                  ON t.OrderItemID = s.OrderItemID
+                WHEN MATCHED THEN UPDATE SET
+                  OrderId=@OrderId, ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQTY
+                WHEN NOT MATCHED THEN INSERT (OrderItemID, OrderId, ItemID, Qualifier, OrderedQTY)
+                  VALUES (@OrderItemID, @OrderId, @ItemID, @Qualifier, @OrderedQTY);
+              `);
+            upsertedItems++;
+          }
+        }
+      }
+
+      await tx.commit();
+    } catch (e) {
+      await tx.rollback();
       throw e;
     }
 
-    const { countH, countI } = await upsertPayload(pool, resp.data, { includeItems: true });
-    importedHeaders += countH;
-    upsertedItems += countI;
-
-    if (countH === 0) break;      // no more pages
-    if (importedHeaders >= limit) break;
-    page++;
+    // stop if the last page likely returned fewer than requested
+    if (orders.length < pageSize) break;
   }
 
   return { importedHeaders, upsertedItems };
-}
-
-function countPayload(payload, includeItems) {
-  const { list } = pickOrderArray(payload);
-  let cH = Array.isArray(list) ? list.length : 0;
-  let cI = 0;
-  if (includeItems && cH) {
-    for (const o of list) cI += mapItems(o).length;
-  }
-  return { countH: cH, countI: cI };
-}
-
-async function upsertPayload(pool, payload, { includeItems }) {
-  const { list } = pickOrderArray(payload);
-  if (!Array.isArray(list) || !list.length) return { countH: 0, countI: 0 };
-
-  const tx = new sql.Transaction(pool);
-  await tx.begin();
-  try {
-    let itemCount = 0;
-    for (const o of list) {
-      const h = mapHeader(o);
-      if (!h.OrderId) continue;
-      await upsertHeaderTx(tx, h);
-      if (includeItems) {
-        const items = mapItems(o);
-        for (const it of items) {
-          if (!it.OrderItemId) continue;
-          await upsertItemTx(tx, it);
-          itemCount++;
-        }
-      }
-    }
-    await tx.commit();
-    return { countH: list.length, countI: itemCount };
-  } catch (e) {
-    await tx.rollback();
-    throw e;
-  }
-}
-
-/** ---------- Simple peek for debugging ---------- **/
-export async function peekOrders({ pgsiz = 1, pgnum = 1 } = {}) {
-  const api = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
-  const url = `${api}/orders`;
-  const headers = await authHeaders();
-  const { data, status } = await axios.get(url, {
-    headers: { ...headers, "Accept-Language": "en-US,en;q=0.8" },
-    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
-    timeout: TIMEOUT,
-    validateStatus: () => true,
-  });
-  return { status, data };
 }
