@@ -5,21 +5,74 @@ import { getPool, sql } from "./db/mssql.js";
 const TIMEOUT = 20000;
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 
-/* ------------------------ AUTH: BASIC-ONLY ------------------------ */
-export async function authHeaders() {
-  const b64 =
-    process.env.EXT_BASIC_AUTH_B64 ||
-    Buffer.from(`${process.env.EXT_CLIENT_ID}:${process.env.EXT_CLIENT_SECRET}`).toString("base64");
+/* -------------------- AUTH (Bearer with robust token fetch) -------------------- */
 
-  if (!b64) throw new Error("Missing EXT_BASIC_AUTH_B64 or CLIENT_ID/CLIENT_SECRET");
-  return { Authorization: `Basic ${b64}`, Accept: "application/json" };
+let tokenCache = { value: null, exp: 0 };
+
+function basicB64() {
+  return (
+    process.env.EXT_BASIC_AUTH_B64 ||
+    Buffer.from(`${process.env.EXT_CLIENT_ID}:${process.env.EXT_CLIENT_SECRET}`).toString("base64")
+  );
 }
 
-/* -------------------------- HELPERS ------------------------------ */
+async function fetchOAuthToken() {
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const tries = [
+    process.env.EXT_TOKEN_URL,                       // preferred (set to https://secure-wms.com/oauth/token)
+    "https://secure-wms.com/oauth/token",           // known good for many sandboxes
+    `${base}/oauth/token`,                          // some tenants expose at their base
+  ].filter(Boolean);
+
+  const body = {
+    grant_type: "client_credentials",
+    user_login: process.env.EXT_USER_LOGIN || undefined,
+  };
+
+  let lastErr = null;
+  for (const url of tries) {
+    try {
+      const r = await axios.post(url, body, {
+        headers: {
+          Authorization: `Basic ${basicB64()}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: TIMEOUT,
+        validateStatus: () => true,
+      });
+      if (r.status >= 400) {
+        lastErr = { where: url, status: r.status, data: r.data };
+        continue;
+      }
+      const tok = r.data?.access_token || r.data?.token || r.data?.accessToken;
+      const expSec = Number(r.data?.expires_in || 300);
+      if (!tok) throw new Error(`Token response missing access_token from ${url}`);
+      tokenCache = { value: tok, exp: Date.now() + (expSec - 30) * 1000 };
+      return tok;
+    } catch (e) {
+      lastErr = { where: url, status: e.response?.status, data: e.response?.data || e.message };
+    }
+  }
+  const msg = lastErr?.status ? `OAuth ${lastErr.status} at ${lastErr.where}` : `OAuth failed`;
+  const err = new Error(msg);
+  err.response = lastErr;
+  throw err;
+}
+
+export async function authHeaders() {
+  // hard lock to bearer because EXT_AUTH_MODE=bearer
+  const now = Date.now();
+  const tok = tokenCache.value && tokenCache.exp > now ? tokenCache.value : await fetchOAuthToken();
+  return { Authorization: `Bearer ${tok}`, Accept: "application/json" };
+}
+
+/* ----------------------------- helpers ----------------------------- */
+
 function listify(data) {
   if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.ResourceList)) return data.ResourceList; // legacy
-  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.ResourceList)) return data.ResourceList; // legacy list shape
+  if (Array.isArray(data?.data)) return data.data;                 // some v1 shapes
   for (const v of Object.values(data || {})) if (Array.isArray(v)) return v;
   return [];
 }
@@ -45,44 +98,29 @@ function extractItems(detail) {
 
   return items.map((it) => ({
     orderItemId:
-      it?.OrderItemID ??
-      it?.OrderLineId ??
-      it?.OrderLineID ??
-      it?.Id ??
-      it?.id ??
-      null,
+      it?.OrderItemID ?? it?.OrderLineId ?? it?.OrderLineID ?? it?.Id ?? it?.id ?? null,
     sku:
-      it?.SKU ??
-      it?.Sku ??
-      it?.ItemCode ??
-      it?.ItemID ??
-      it?.ItemIdentifier?.ItemCode ??
-      "",
+      it?.SKU ?? it?.Sku ?? it?.ItemCode ?? it?.ItemID ?? it?.ItemIdentifier?.ItemCode ?? "",
     qualifier: it?.Qualifier ?? it?.UOM ?? it?.UnitOfMeasure ?? "",
     qty: Number(
-      it?.OrderedQty ??
-      it?.OrderedQuantity ??
-      it?.Quantity ??
-      it?.Qty ??
-      it?.QtyOrdered ??
-      0
+      it?.OrderedQty ?? it?.OrderedQuantity ?? it?.Quantity ?? it?.Qty ?? it?.QtyOrdered ?? 0
     ) || 0,
   }));
 }
 
-/* --------------------------- API CALLS --------------------------- */
+/* ----------------------------- API calls --------------------------- */
+
 export async function listOrders() {
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const headers = await authHeaders();
-  const url = `${base}/orders`;
+  const url = `${base}/orders`; // legacy listing endpoint that returned 200 for you
 
   const r = await axios.get(url, { headers, timeout: TIMEOUT, validateStatus: () => true });
-  if (r.status === 401) {
-    throw new Error(`401 from ${url} — check EXT_BASIC_AUTH_B64 (base64(clientId:clientSecret))`);
-  }
   if (r.status >= 400) {
     const body = typeof r.data === "string" ? r.data.slice(0, 300) : JSON.stringify(r.data).slice(0, 300);
-    throw new Error(`${r.status} from ${url} — ${body}`);
+    const err = new Error(`${r.status} from ${url}`);
+    err.response = { status: r.status, data: body };
+    throw err;
   }
   return listify(r.data);
 }
@@ -92,8 +130,8 @@ export async function fetchOneOrderDetail(orderId) {
   const headers = await authHeaders();
 
   const tries = [
-    `${base}/orders/${orderId}`,          // legacy detail
-    `${base}/orders/${orderId}/details`,  // legacy explicit
+    `${base}/orders/${orderId}`,          // legacy detail (often works)
+    `${base}/orders/${orderId}/details`,  // legacy explicit details
     `${base}/api/v1/orders/${orderId}`,   // v1 fallback
     `${base}/api/v1/orders/${orderId}/details`,
   ];
@@ -109,14 +147,16 @@ export async function fetchOneOrderDetail(orderId) {
     }
   }
   const snippet = typeof last?.data === "string" ? last.data.slice(0, 300) : JSON.stringify(last?.data || "").slice(0, 300);
-  throw new Error(`Order ${orderId} detail failed — last tried ${last?.url} (${last?.status}): ${snippet}`);
+  const err = new Error(`Order ${orderId} detail failed at ${last?.url} (${last?.status})`);
+  err.response = { status: last?.status, data: snippet };
+  throw err;
 }
 
-/* ---------------- IMPORT (headers + line items) ------------------ */
+/* ----------------------- Import (headers + items) ------------------ */
+
 export async function fetchAndUpsertOrders({ limit } = {}) {
   const pool = await getPool();
 
-  // Ensure table exists
   await pool.request().batch(`
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
 BEGIN
@@ -130,14 +170,12 @@ BEGIN
 END
   `);
 
-  // 1) headers
   const headers = await listOrders();
   const slice = typeof limit === "number" ? headers.slice(0, Math.max(0, limit)) : headers;
 
   let importedHeaders = slice.length;
   let upsertedItems = 0;
 
-  // 2) details -> upsert
   const tx = new sql.Transaction(await getPool());
   await tx.begin();
   try {
@@ -150,8 +188,7 @@ END
       let detail;
       try {
         detail = await fetchOneOrderDetail(orderId);
-      } catch (e) {
-        // Keep going; report after commit
+      } catch {
         continue;
       }
 
