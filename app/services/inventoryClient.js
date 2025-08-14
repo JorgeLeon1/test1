@@ -1,89 +1,135 @@
-// app/services/allocService.js
+// app/services/inventoryClient.js
+import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
+import { authHeaders } from "./extensivClient.js";
 
-/**
- * Greedy allocation: for each order line in dbo.OrderDetails,
- * grab from Inventory rows (same ItemID) sorted by Available DESC
- * until the line qty is satisfied. Writes dbo.Allocations.
- */
-export async function runAllocationAndRead() {
+const trimBase = (u) => (u || "").replace(/\/+$/, "");
+const TIMEOUT = 20000;
+
+// Extract an array from various API response shapes
+const listify = (data) => {
+  if (Array.isArray(data)) return data;
+  const keys = ["ResourceList", "data", "items", "Items", "records", "Records", "value"];
+  for (const k of keys) if (Array.isArray(data?.[k])) return data[k];
+  if (data && typeof data === "object") {
+    for (const v of Object.values(data)) if (Array.isArray(v)) return v;
+  }
+  return [];
+};
+
+// ✅ Named export required by app/routes/extensiv.js
+export async function importInventory() {
+  const base =
+    trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
   const pool = await getPool();
 
-  // tables
+  // Ensure target table exists (idempotent)
   await pool.request().batch(`
-IF OBJECT_ID('dbo.Allocations','U') IS NULL
+IF OBJECT_ID('dbo.Inventory','U') IS NULL
 BEGIN
-  CREATE TABLE dbo.Allocations (
-    Id         INT IDENTITY(1,1) PRIMARY KEY,
-    OrderId    INT NULL,
-    ItemID     VARCHAR(100) NOT NULL,
-    Qualifier  VARCHAR(50)  NULL,
-    Location   VARCHAR(100) NULL,
-    Qty        INT          NOT NULL DEFAULT 0,
-    CreatedAt  DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME()
+  CREATE TABLE dbo.Inventory (
+    ItemID      VARCHAR(100) NOT NULL,
+    Location    VARCHAR(100) NULL,
+    OnHand      INT          NULL,
+    Allocated   INT          NULL,
+    Available   INT          NULL,
+    PRIMARY KEY (ItemID, ISNULL(Location,''))
   );
+END
+ELSE
+BEGIN
+  IF COL_LENGTH('dbo.Inventory','Allocated') IS NULL ALTER TABLE dbo.Inventory ADD Allocated INT NULL;
+  IF COL_LENGTH('dbo.Inventory','Available') IS NULL ALTER TABLE dbo.Inventory ADD Available INT NULL;
 END
   `);
 
-  // load demand (order lines) and supply (inventory)
-  const lines = (await pool.request().query(`
-    SELECT OrderId, ItemID, ISNULL(Qualifier,'') as Qualifier, OrderedQTY
-    FROM dbo.OrderDetails
-  `)).recordset;
+  // Try common inventory endpoints used by tenants
+  const urls = [
+    `${base}/inventory`,
+    `${base}/api/v1/inventory`,
+    `${base}/api/inventory`,
+    `${base}/items/inventory`,
+  ];
 
-  const invRows = (await pool.request().query(`
-    SELECT ItemID, ISNULL(Location,'') AS Location, Available
-    FROM dbo.Inventory WHERE Available > 0
-  `)).recordset;
+  let rows = [];
+  let lastErr = null;
 
-  // index inventory by item
-  const byItem = new Map();
-  for (const r of invRows) {
-    if (!byItem.has(r.ItemID)) byItem.set(r.ItemID, []);
-    byItem.get(r.ItemID).push({ loc: r.Location, avail: Number(r.Available) || 0 });
+  for (const url of urls) {
+    try {
+      const r = await axios.get(url, { headers, timeout: TIMEOUT });
+      rows = listify(r.data);
+      if (rows.length) break;
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  for (const arr of byItem.values()) arr.sort((a,b)=>b.avail-a.avail);
 
-  // allocate
+  // If nothing came back, return a safe result instead of crashing boot
+  if (!rows.length) {
+    return {
+      upsertedInventory: 0,
+      note:
+        lastErr?.response?.status
+          ? `No rows from Extensiv (HTTP ${lastErr.response.status})`
+          : "No rows from Extensiv",
+    };
+  }
+
+  // Normalize + upsert
+  let upserted = 0;
   const tx = new sql.Transaction(pool);
   await tx.begin();
   try {
     const req = new sql.Request(tx);
-    let applied = 0;
 
-    for (const line of lines) {
-      let need = Number(line.OrderedQTY) || 0;
-      const buckets = byItem.get(line.ItemID) || [];
-      for (const b of buckets) {
-        if (need <= 0 || b.avail <= 0) continue;
-        const take = Math.min(need, b.avail);
-        await req
-          .input("OrderId", sql.Int, line.OrderId ?? null)
-          .input("ItemID", sql.VarChar(100), line.ItemID)
-          .input("Qualifier", sql.VarChar(50), line.Qualifier || "")
-          .input("Location", sql.VarChar(100), b.loc || "")
-          .input("Qty", sql.Int, take)
-          .query(`
-INSERT INTO dbo.Allocations (OrderId, ItemID, Qualifier, Location, Qty)
-VALUES (@OrderId, @ItemID, @Qualifier, @Location, @Qty);
-          `);
-        b.avail -= take;
-        need    -= take;
-        applied += take;
-        if (need <= 0) break;
-      }
+    for (const rec of rows) {
+      const item =
+        rec?.ItemID ??
+        rec?.ItemId ??
+        rec?.ItemCode ??
+        rec?.SKU ??
+        rec?.ItemIdentifier?.ItemCode ??
+        rec?.ItemIdentifier?.Sku ??
+        "";
+
+      if (!item) continue;
+
+      const location =
+        rec?.Location ??
+        rec?.LocationId ??
+        rec?.LocationIdentifier?.NameKey?.Name ??
+        rec?.LocationIdentifier?.Name ??
+        "";
+
+      const onHand = Number(rec?.OnHand ?? rec?.QtyOnHand ?? rec?.QuantityOnHand ?? 0);
+      const allocated = Number(rec?.Allocated ?? rec?.QtyAllocated ?? 0);
+      const available = Number(rec?.Available ?? onHand - allocated);
+
+      await req
+        .input("ItemID", sql.VarChar(100), item)
+        .input("Location", sql.VarChar(100), location || "")
+        .input("OnHand", sql.Int, onHand)
+        .input("Allocated", sql.Int, allocated)
+        .input("Available", sql.Int, available)
+        .query(`
+MERGE dbo.Inventory AS t
+USING (SELECT @ItemID AS ItemID, @Location AS Location) s
+  ON t.ItemID = s.ItemID AND ISNULL(t.Location,'') = ISNULL(s.Location,'')
+WHEN MATCHED THEN UPDATE
+  SET OnHand=@OnHand, Allocated=@Allocated, Available=@Available
+WHEN NOT MATCHED THEN INSERT (ItemID, Location, OnHand, Allocated, Available)
+  VALUES (@ItemID, @Location, @OnHand, @Allocated, @Available);
+        `);
+
+      upserted++;
     }
 
     await tx.commit();
-
-    // return what we wrote
-    const rows = (await pool.request().query(`
-      SELECT TOP 200 * FROM dbo.Allocations ORDER BY Id DESC
-    `)).recordset;
-
-    return { applied, rows };
   } catch (e) {
     await tx.rollback();
     throw e;
   }
+
+  return { upsertedInventory: upserted };
 }
