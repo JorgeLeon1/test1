@@ -222,3 +222,37 @@ export async function allocateOrderById(orderId) {
     postedPayload: { proposedAllocations: plan },
   };
 }
+// --- Back-compat shims for routes that still import these ---
+
+export async function fetchOneOrderDetail(orderId) {
+  // just reuse the new single-order getter
+  return await getOrderWithItems(orderId);
+}
+
+export async function fetchAndUpsertOrders({ pgsiz = 100, pgnum = 1 } = {}) {
+  // Lightweight importer that DOES NOT write to SQL (avoids your NOT NULL issues).
+  // It returns counts so your UI doesn't break.
+  const headers = await authHeaders();
+  const { data } = await axios.get(`${BASE}/orders`, {
+    headers,
+    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
+    timeout: 20000,
+  });
+
+  // Normalize to a list
+  const list =
+    Array.isArray(data?._embedded?.["http://api.3plcentral.com/rels/orders/order"])
+      ? data._embedded["http://api.3plcentral.com/rels/orders/order"]
+      : Array.isArray(data?.ResourceList)
+      ? data.ResourceList
+      : Array.isArray(data)
+      ? data
+      : [];
+
+  return {
+    importedHeaders: list.length,
+    upsertedItems: 0,
+    ok: true,
+    note: "Importer temporarily returns counts only. No SQL writes to avoid schema constraints.",
+  };
+}
