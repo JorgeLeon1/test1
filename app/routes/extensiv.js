@@ -1,27 +1,11 @@
 // src/app/routes/extensiv.js
 import { Router } from "express";
 import axios from "axios";
-
-import {
-  authHeaders,
-  // back-compat shims (provided in extensivClient.js)
-  fetchAndUpsertOrders,
-  fetchOneOrderDetail,
-  // new allocation helpers (if you added them)
-  getOrderWithItems,
-  buildAllocationPlan,
-  allocateOrderById,
-} from "../services/extensivClient.js";
-
-import { importInventory } from "../services/inventoryClient.js";
-import { runAllocationAndRead } from "../services/allocService.js";
-import { pushAllocations } from "../services/pushAllocations.js";
+import { authHeaders, fetchAndUpsertOrders, fetchOneOrderDetail } from "../services/extensivClient.js";
 import { getPool } from "../services/db/mssql.js";
 
-/* --------------------------- INIT ROUTER FIRST --------------------------- */
 const r = Router();
 
-/* ------------------------------ helpers ---------------------------------- */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const firstArray = (data) => {
   if (Array.isArray(data)) return data;
@@ -33,7 +17,6 @@ const firstArray = (data) => {
   return [];
 };
 
-/* -------------------------------- DEBUG ---------------------------------- */
 r.get("/_debug", (_req, res) => {
   res.json({
     routeMounted: true,
@@ -61,42 +44,31 @@ r.get("/_debug", (_req, res) => {
 r.get("/token", async (_req, res, next) => {
   try {
     const h = await authHeaders();
-    const bearer = h.Authorization?.startsWith("Bearer ")
-      ? h.Authorization.slice(7)
-      : "";
-    res.json({
-      ok: true,
-      tokenLen: bearer.length,
-      head: bearer.slice(0, 12),
-      tail: bearer.slice(-8),
-    });
+    const bearer = h.Authorization?.startsWith("Bearer ") ? h.Authorization.slice(7) : "";
+    res.json({ ok: true, tokenLen: bearer.length, head: bearer.slice(0, 12), tail: bearer.slice(-8) });
   } catch (e) {
     next(e);
   }
 });
 
-/* --------------------------------- PEEK ---------------------------------- */
 r.get("/peek", async (_req, res, next) => {
   try {
-    const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
-    );
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
     const h = await authHeaders();
     const resp = await axios.get(`${base}/orders`, { headers: h, timeout: 15000 });
     const data = resp.data;
     const list = firstArray(data);
-
     res.json({
       ok: true,
       status: resp.status,
       topLevelType: Array.isArray(data) ? "array" : "object",
       keys: data && typeof data === "object" ? Object.keys(data) : [],
-      firstArrayKey: Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])
-        ? "_embedded[orders/order]"
-        : Array.isArray(data?.ResourceList)
+      firstArrayKey: Array.isArray(data?.ResourceList)
         ? "ResourceList"
         : Array.isArray(data?.data)
         ? "data"
+        : Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])
+        ? "_embedded/orders/order"
         : Array.isArray(data)
         ? "(root)"
         : "none",
@@ -112,47 +84,9 @@ r.get("/peekOrder", async (req, res, next) => {
   try {
     const id = Number(req.query.id);
     if (!id) return res.status(400).json({ ok: false, message: "Provide ?id=<OrderId>" });
-
     const payload = await fetchOneOrderDetail(id);
     const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
-
-    let itemArrayKey = "unknown";
-    let items = [];
-    if (Array.isArray(payload?._embedded?.["http://api.3plCentral.com/rels/orders/item"])) {
-      itemArrayKey = "_embedded[orders/item]";
-      items = payload._embedded["http://api.3plCentral.com/rels/orders/item"];
-    } else if (Array.isArray(payload?.OrderLineItems)) {
-      itemArrayKey = "OrderLineItems";
-      items = payload.OrderLineItems;
-    } else if (Array.isArray(payload?.Items)) {
-      itemArrayKey = "Items";
-      items = payload.Items;
-    } else if (Array.isArray(payload?.ResourceList)) {
-      itemArrayKey = "ResourceList";
-      items = payload.ResourceList;
-    } else if (Array.isArray(payload?.data)) {
-      itemArrayKey = "data";
-      items = payload.data;
-    }
-
-    res.json({
-      ok: true,
-      orderId: id,
-      keys,
-      itemArrayKey,
-      itemsFound: items.length,
-      sampleItem: items[0] || null,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
-
-/* -------------------------- INVENTORY + ORDERS --------------------------- */
-r.post("/inventory-import", async (_req, res, next) => {
-  try {
-    const result = await importInventory();
-    res.json(result);
+    res.json({ ok: true, orderId: id, keys, sample: payload });
   } catch (e) {
     next(e);
   }
@@ -167,62 +101,13 @@ r.post("/import", async (req, res, next) => {
   }
 });
 
-/* --------------------------- ALLOCATION (NEW) ---------------------------- */
-// Build a plan (no write)
-r.post("/plan-order", async (req, res, next) => {
-  try {
-    const { orderId, mode = "fifo" } = req.body || {};
-    if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
-
-    const plan = await buildAllocationPlan(orderId, { mode });
-    res.json({ ok: true, orderId, plan });
-  } catch (e) {
-    next(e);
-  }
-});
-
-// Allocate (POST to /orders/{id}/allocator)
-r.post("/allocate-order", async (req, res, next) => {
-  try {
-    const { orderId, mode = "fifo" } = req.body || {};
-    if (!orderId) return res.status(400).json({ ok: false, message: "orderId is required" });
-
-    const out = await allocateOrderById(orderId, { mode });
-    res.json(out);
-  } catch (e) {
-    next(e);
-  }
-});
-
-/* ------------------------------ LEGACY DEMO ------------------------------ */
-r.post("/allocate", async (_req, res, next) => {
-  try {
-    const { applied, rows } = await runAllocationAndRead();
-    res.json({ applied, suggestions: rows });
-  } catch (e) {
-    next(e);
-  }
-});
-
-r.post("/push", async (_req, res, next) => {
-  try {
-    const result = await pushAllocations();
-    res.json(result);
-  } catch (e) {
-    next(e);
-  }
-});
-
-/* ------------------------------- SELFTEST -------------------------------- */
 r.get("/selftest", async (_req, res) => {
   const out = { ok: false, steps: {} };
   try {
     const headers = await authHeaders();
     out.steps.auth = "ok";
 
-    const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
-    );
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
     const o = await axios.get(`${base}/orders`, { headers, timeout: 15000 });
     const list = firstArray(o.data);
     out.steps.orders = { status: o.status, count: list.length };
@@ -236,29 +121,9 @@ IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
   CREATE TABLE dbo.OrderDetails (
     OrderItemID INT NULL,
     OrderId     INT NULL,
-    CustomerID  INT NULL,
     ItemID      VARCHAR(100) NULL,
     Qualifier   VARCHAR(50) NULL,
     OrderedQTY  INT NULL
-  );
-IF OBJECT_ID('dbo.Inventory','U') IS NULL
-  CREATE TABLE dbo.Inventory (
-    ItemID      VARCHAR(100) NOT NULL,
-    Location    VARCHAR(100) NULL,
-    OnHand      INT NULL,
-    Allocated   INT NULL,
-    Available   INT NULL,
-    PRIMARY KEY (ItemID, ISNULL(Location,''))
-  );
-IF OBJECT_ID('dbo.Allocations','U') IS NULL
-  CREATE TABLE dbo.Allocations (
-    Id         INT IDENTITY(1,1) PRIMARY KEY,
-    OrderId    INT NULL,
-    ItemID     VARCHAR(100) NOT NULL,
-    Qualifier  VARCHAR(50)  NULL,
-    Location   VARCHAR(100) NULL,
-    Qty        INT          NOT NULL DEFAULT 0,
-    CreatedAt  DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME()
   );
     `);
 
@@ -268,13 +133,7 @@ IF OBJECT_ID('dbo.Allocations','U') IS NULL
   } catch (e) {
     res.status(500).json({
       ok: false,
-      where: out.steps.auth
-        ? out.steps.orders
-          ? out.steps.db
-            ? "tables"
-            : "db"
-          : "orders"
-        : "auth",
+      where: out.steps.auth ? (out.steps.orders ? (out.steps.db ? "tables" : "db") : "orders") : "auth",
       status: e.response?.status || 500,
       message: e.message,
       data: e.response?.data,
