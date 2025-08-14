@@ -3,6 +3,47 @@ import { Router } from "express";
 import axios from "axios";
 import { authHeaders, fetchAndUpsertOrders, fetchOneOrderDetail } from "../services/extensivClient.js";
 import { getPool } from "../services/db/mssql.js";
+import {
+  getOrderWithItems,
+  buildAllocationPlan,
+  allocateOrderById,
+} from "../services/extensivClient.js";
+
+// Dry-run: build the plan but DO NOT post to Extensiv
+r.post("/plan-order", async (req, res, next) => {
+  try {
+    const orderId = Number(req.body?.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Provide { orderId }" });
+
+    const order = await getOrderWithItems(orderId);
+    const { plan, debug } = await buildAllocationPlan(order);
+
+    res.json({
+      ok: true,
+      orderId,
+      itemsPlanned: plan.length,
+      previewPayload: { proposedAllocations: plan },
+      debug,
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Live allocate: build plan and POST /orders/{id}/allocator
+r.post("/allocate-order", async (req, res, next) => {
+  try {
+    const orderId = Number(req.body?.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Provide { orderId }" });
+
+    const result = await allocateOrderById(orderId);
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (e) {
+    next(e);
+  }
+});
+
+
 
 const r = Router();
 
