@@ -1,260 +1,267 @@
-import express from 'express';
-import session from 'express-session';
-// import bodyParser from 'body-parser'; // not needed (you already use express.json/urlencoded)
-import multer from 'multer';
-import path from 'path';
-import { dirname } from 'path';
-import { fileURLToPath } from 'url';
-import cors from 'cors';
-import fs from 'fs';
-import connectToDatabase from './connectTodb.js';
-import nodemailer from 'nodemailer';
-import allocateOrders from './app/allocateOrder.js';
-import axios from 'axios';
+// app/routes/extensiv.js
+import { Router } from "express";
+import axios from "axios";
 
-// 1) Load env FIRST
-import dotenv from 'dotenv';
-dotenv.config();
+import {
+  authHeaders,
+  fetchAndUpsertOrders,
+  fetchOneOrderDetail,
+} from "../services/extensivClient.js";
 
-// 2) Create the Express app BEFORE using it
-const app = express();
-app.use(express.json());
-app.use(cors());
-app.use(express.urlencoded({ extended: true }));
+import { importInventory } from "../services/inventoryClient.js";
+import { runAllocationAndRead } from "../services/allocService.js";
+import { pushAllocations } from "../services/pushAllocations.js";
+import { getPool } from "../services/db/mssql.js";
 
-// 3) Static files (so /public/*.html works)
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-app.use(express.static('public'));
+const r = Router();
+const trimBase = (u) => (u || "").replace(/\/+$/, "");
 
-// 4) Mount new Extensiv routes AFTER app exists
-import extensiv from './app/routes/extensiv.js';
-app.use('/extensiv', extensiv);
+const firstArray = (data) => {
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.ResourceList)) return data.ResourceList; // legacy list
+  if (Array.isArray(data?.data)) return data.data;
+  for (const v of Object.values(data || {})) if (Array.isArray(v)) return v;
+  return [];
+};
 
-// 5) Quick health check
-app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+/* ------------------------------ DEBUG ------------------------------ */
 
-// ---- Session Configuration
-app.use(session({
-  secret: 'your_secret_key',
-  resave: false,
-  saveUninitialized: true,
-  cookie: { secure: false, maxAge: 30 * 60 * 10000 }, // 30 minutes
-}));
-
-// ---- Multer upload setup
-const uploadDir = path.join(__dirname, 'Uploaded940s');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+r.get("/_debug", (_req, res) => {
+  res.json({
+    routeMounted: true,
+    envPresent: {
+      EXT_API_BASE: !!process.env.EXT_API_BASE,
+      EXT_BASE_URL: !!process.env.EXT_BASE_URL,
+      EXT_AUTH_MODE: process.env.EXT_AUTH_MODE || null,
+      EXT_CLIENT_ID: !!process.env.EXT_CLIENT_ID,
+      EXT_CLIENT_SECRET: !!process.env.EXT_CLIENT_SECRET,
+      EXT_BASIC_AUTH_B64: !!process.env.EXT_BASIC_AUTH_B64,
+      EXT_TOKEN_URL: !!process.env.EXT_TOKEN_URL,
+      EXT_TPL_GUID: !!process.env.EXT_TPL_GUID,
+      EXT_USER_LOGIN: !!process.env.EXT_USER_LOGIN,
+      EXT_USER_LOGIN_ID: !!process.env.EXT_USER_LOGIN_ID,
+      EXT_CUSTOMER_IDS: !!process.env.EXT_CUSTOMER_IDS,
+      EXT_FACILITY_IDS: !!process.env.EXT_FACILITY_IDS,
+      SQL_SERVER: !!process.env.SQL_SERVER,
+      SQL_DATABASE: !!process.env.SQL_DATABASE,
+      SQL_USER: !!process.env.SQL_USER,
+      SQL_PASSWORD: !!process.env.SQL_PASSWORD,
+    },
+  });
 });
-const upload = multer({ storage });
 
-// ---- Helpers
-function transformLocations(data) {
-  const locations_to_highlight = {};
-  data.forEach(item => {
-    const sku = item.sku;
-    (item.locations || []).forEach(location => {
-      const locName = location.LocationIdentifier?.NameKey?.Name?.toLowerCase();
-      if (!locName) return;
-      const onHand = location.OnHand || 0;
-      if (locations_to_highlight[locName]) {
-        locations_to_highlight[locName].quantity += onHand;
-      } else {
-        locations_to_highlight[locName] = { sku, quantity: onHand };
-      }
+// Quick token sanity check (length only)
+r.get("/token", async (_req, res, next) => {
+  try {
+    const h = await authHeaders();
+    const bearer = h.Authorization?.startsWith("Bearer ")
+      ? h.Authorization.slice(7)
+      : "";
+    res.json({
+      ok: true,
+      tokenLen: bearer.length,
+      head: bearer.slice(0, 12),
+      tail: bearer.slice(-8),
     });
-  });
-  return locations_to_highlight;
-}
-
-// ---- Routes
-const users = [
-  { username: 'YS', password: 'testCus1' },
-  { username: 'mw', password: 'wmadmin' },
-  { username: 'sw', password: 'wmadmin2' },
-  { username: 'crystal', password: 'admin123' }
-];
-
-app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
-
-// login
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username && u.password === password);
-  if (user) {
-    req.session.user = username;
-    res.redirect('/portal');
-  } else {
-    res.status(401).send('Invalid username or password');
+  } catch (e) {
+    next(e);
   }
 });
 
-// logout
-app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.redirect('/'));
-});
+/* ------------------------------ PEEK ------------------------------- */
 
-// auth middleware
-function isAuthenticated(req, res, next) {
-  if (req.session.user) return next();
-  res.redirect('/');
-}
-
-app.get('/landing', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'landing.html'))
-);
-
-app.get('/allocateOrders', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'allocateOrders.html'))
-);
-
-app.get('/order', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'order.html'))
-);
-
-app.get('/seeDatabaseData', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'seeDatabaseData.html'))
-);
-
-app.get('/portal', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'portal.html'))
-);
-
-app.get('/help', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'helpPage.html'))
-);
-
-app.get('/getOrdersPage', (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'seeOrderlines.html'))
-);
-
-app.get('/orderReport', (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'seeOrderHeadersAndLines.html'))
-);
-
-app.get('/reports', isAuthenticated, (_req, res) =>
-  res.sendFile(path.join(__dirname, 'public', 'reportsLanding.html'))
-);
-
-app.get('/account', isAuthenticated, (_req, res) =>
-  res.send('Coming soon! Here, you can edit your profile...')
-);
-
-// sample DB JSON route
-app.get('/googleSpreadsheetorders', isAuthenticated, async (_req, res) => {
+// Shows shape of legacy orders list
+r.get("/peek", async (_req, res, next) => {
   try {
-    const results = await connectToDatabase(`
-      SELECT orderId as orderNum, gs.insertedDate as date_processed, c.customerName as customer, gs.success
-      FROM OrdersSentToGoogleSheet gs
-      INNER JOIN Customer c ON c.id = gs.customerId
-    `);
-    res.status(200).json(results);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving data from database');
-  }
-});
-
-// misc routes
-app.post('/submit-form', (req, res) => {
-  console.log('Form Data:', req.body);
-  res.send('Form submitted successfully');
-});
-
-app.post('/upload', upload.array('files', 3), (req, res) => {
-  if (!req.files?.length) return res.status(400).json({ message: 'No files uploaded' });
-  const uploadedFiles = req.files.map(file => file.filename);
-  res.json({ message: 'Files uploaded successfully', files: uploadedFiles });
-});
-
-app.post('/send-message', async (req, res) => {
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ message: 'Message is required.' });
-
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: 'westmarkportal@wilenconsulting.com',
-      pass: 'znlr wlej ikiy ladg' // consider env var
-    }
-  });
-
-  const mailOptions = {
-    from: '"Westmark Portal Contact Form" <westmarkportal@wilenconsulting.com>',
-    to: 'support@wilenconsulting.com',
-    cc: 'yael@wilenconsulting.com',
-    subject: 'New Message from Wm Help Center',
-    text: message
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    res.status(200).json({ message: 'Message sent successfully!' });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Failed to send message.' });
-  }
-});
-
-app.get('/check-session', (req, res) => {
-  res.json({ loggedIn: !!req.session.user });
-});
-
-// legacy allocate route (your existing logic)
-app.post('/allocateOrders', async (req, res) => {
-  try {
-    const lineIds = req.body.lineIds;
-    const orderLines = await connectToDatabase(
-      `SELECT * FROM OrderItems WHERE id IN (${lineIds.join(',')})`
+    const base = trimBase(
+      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
     );
+    const h = await authHeaders();
+    const resp = await axios.get(`${base}/orders`, { headers: h, timeout: 15000 });
+    const data = resp.data;
+    const list = firstArray(data);
 
-    const allocationResults = await allocateOrders(orderLines);
-    const highlightLocations = transformLocations(allocationResults.allSkusAndLocations);
-
-    // Example: send highlightLocations to Sanic
-    const config = {
-      method: 'post',
-      url: `http://${process.env.SANIC_URL}/hilight_location`,
-      headers: { 'Content-Type': 'application/json' },
-      data: { highlightLocations }
-    };
-    const response = await axios.request(config);
-    console.log(response.data);
-
-    res.json(allocationResults.allocations);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error allocating orders');
+    res.json({
+      ok: true,
+      status: resp.status,
+      topLevelType: Array.isArray(data) ? "array" : "object",
+      keys: data && typeof data === "object" ? Object.keys(data) : [],
+      firstArrayKey: Array.isArray(data?.ResourceList)
+        ? "ResourceList"
+        : Array.isArray(data?.data)
+        ? "data"
+        : Array.isArray(data)
+        ? "(root)"
+        : "none",
+      firstArrayLen: list.length,
+      sample: list[0] || data,
+    });
+  } catch (e) {
+    next(e);
   }
 });
 
-app.post('/forceAllocate', async (_req, res) => { res.sendStatus(204); });
-app.post('/updateAllocation', async (_req, res) => { res.sendStatus(204); });
-app.get('/seeAllAllocations', async (_req, res) => { res.sendStatus(204); });
-app.post('/submitAllocations', async (_req, res) => { res.sendStatus(204); });
+// Peek a single order detail to see where items live
+r.get("/peekOrder", async (req, res, next) => {
+  try {
+    const id = Number(req.query.id);
+    if (!id) return res.status(400).json({ ok: false, message: "Provide ?id=<OrderId>" });
 
-app.get('/getAllLocations', async (_req, res) => { res.sendStatus(204); });
+    const payload = await fetchOneOrderDetail(id);
+    const keys = payload && typeof payload === "object" ? Object.keys(payload) : [];
 
-app.get('/getAllOrders', async (_req, res) => {
-  const results = await connectToDatabase(`
-    SELECT c.customerName, oi.order_id, oi.sku, oi.qty
-    FROM Orders_1 o
-    INNER JOIN Customer c ON o.customer_id = c.id
-    INNER JOIN OrderItems oi ON o.id = oi.order_id
-  `);
-  res.status(200).json(results);
+    const candidates = [
+      "OrderLineItems",
+      "Items",
+      "Details",
+      "Detail",
+      "ResourceList",
+      "data",
+    ].filter((k) => Array.isArray(payload?.[k]) || Array.isArray(payload?.[k]?.OrderLineItems));
+
+    let itemArrayKey = "unknown";
+    let items = [];
+    if (Array.isArray(payload?.OrderLineItems)) {
+      itemArrayKey = "OrderLineItems";
+      items = payload.OrderLineItems;
+    } else if (Array.isArray(payload?.Items)) {
+      itemArrayKey = "Items";
+      items = payload.Items;
+    } else if (Array.isArray(payload?.ResourceList)) {
+      itemArrayKey = "ResourceList";
+      items = payload.ResourceList;
+    } else if (Array.isArray(payload?.data)) {
+      itemArrayKey = "data";
+      items = payload.data;
+    }
+
+    res.json({
+      ok: true,
+      orderId: id,
+      keys,
+      itemArrayKey,
+      itemsFound: items.length,
+      sampleItem: items[0] || null,
+    });
+  } catch (e) {
+    next(e);
+  }
 });
 
-// ---- process handlers
-process.on('uncaughtException', console.error);
-process.on('unhandledRejection', console.error);
+/* ------------------------------ ACTIONS ---------------------------- */
 
-// ---- start server
-const PORT = process.env.PORT || 3030;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on ${PORT}`);
+// Pull order headers + details → dbo.OrderDetails
+r.post("/import", async (req, res, next) => {
+  try {
+    const result = await fetchAndUpsertOrders(req.body || {});
+    res.json(result);
+  } catch (e) {
+    next(e);
+  }
 });
+
+// Pull inventory → dbo.Inventory
+r.post("/inventory-import", async (_req, res, next) => {
+  try {
+    const result = await importInventory();
+    res.json(result);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Greedy allocate using dbo.Inventory → writes dbo.Allocations
+r.post("/allocate", async (_req, res, next) => {
+  try {
+    const { applied, rows } = await runAllocationAndRead();
+    res.json({ applied, suggestions: rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// Preview batches that would be pushed back to Extensiv (stub)
+r.post("/push", async (_req, res, next) => {
+  try {
+    const result = await pushAllocations();
+    res.json(result);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ------------------------------ SELFTEST --------------------------- */
+
+// End-to-end probe: OAuth, orders list, DB connect, ensure tables exist
+r.get("/selftest", async (_req, res) => {
+  const out = { ok: false, steps: {} };
+  try {
+    // OAuth
+    const headers = await authHeaders();
+    out.steps.auth = "ok";
+
+    // Orders (legacy list)
+    const base = trimBase(
+      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+    );
+    const o = await axios.get(`${base}/orders`, { headers, timeout: 15000 });
+    const list = firstArray(o.data);
+    out.steps.orders = { status: o.status, count: list.length };
+
+    // DB connect
+    const pool = await getPool();
+    await pool.request().query("SELECT 1 as ok");
+    out.steps.db = "connect-ok";
+
+    // Ensure target tables exist
+    await pool.request().batch(`
+IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
+  CREATE TABLE dbo.OrderDetails (
+    OrderItemID INT NULL,
+    OrderId     INT NULL,
+    ItemID      VARCHAR(100) NULL,
+    Qualifier   VARCHAR(50) NULL,
+    OrderedQTY  INT NULL
+  );
+IF OBJECT_ID('dbo.Inventory','U') IS NULL
+  CREATE TABLE dbo.Inventory (
+    ItemID      VARCHAR(100) NOT NULL,
+    Location    VARCHAR(100) NULL,
+    OnHand      INT NULL,
+    Allocated   INT NULL,
+    Available   INT NULL,
+    PRIMARY KEY (ItemID, ISNULL(Location,''))
+  );
+IF OBJECT_ID('dbo.Allocations','U') IS NULL
+  CREATE TABLE dbo.Allocations (
+    Id         INT IDENTITY(1,1) PRIMARY KEY,
+    OrderId    INT NULL,
+    ItemID     VARCHAR(100) NOT NULL,
+    Qualifier  VARCHAR(50)  NULL,
+    Location   VARCHAR(100) NULL,
+    Qty        INT          NOT NULL DEFAULT 0,
+    CreatedAt  DATETIME2    NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+    `);
+    out.steps.tables = "ok";
+
+    out.ok = true;
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      where: out.steps.auth
+        ? out.steps.orders
+          ? out.steps.db
+            ? "tables"
+            : "db"
+          : "orders"
+        : "auth",
+      status: e.response?.status || 500,
+      message: e.message,
+      data: e.response?.data,
+    });
+  }
+});
+
+export default r;
