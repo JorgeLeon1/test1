@@ -2,14 +2,12 @@
 import axios from "axios";
 import { getPool, sql } from "./db/mssql.js";
 
-/* ===================== small helpers ===================== */
+/* --------------------------- small helpers --------------------------- */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
-const safeStr = (v, max) =>
-  v == null ? null : String(v).normalize("NFC").slice(0, max);
+const safeStr = (v, max) => (v == null ? null : String(v).normalize("NFC").slice(0, max));
 const toInt = (v, def = 0) => {
   const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return Math.trunc(n);
+  return Number.isFinite(n) ? Math.trunc(n) : def;
 };
 
 function firstArray(obj) {
@@ -21,7 +19,7 @@ function firstArray(obj) {
   for (const v of Object.values(obj || {})) if (Array.isArray(v)) return v;
   return [];
 }
-function readOnly(o) { return o?.readOnly || o?.ReadOnly || {}; }
+const readOnly = (o) => o?.readOnly || o?.ReadOnly || {};
 function itemsFromOrder(ord) {
   const em = ord?._embedded;
   if (em && Array.isArray(em["http://api.3plCentral.com/rels/orders/item"])) {
@@ -32,7 +30,7 @@ function itemsFromOrder(ord) {
   return [];
 }
 
-/* ===================== auth (basic or oauth) ===================== */
+/* --------------------------- auth (basic / oauth) --------------------------- */
 function basicHeaderFromEnv() {
   const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
   return b64 ? `Basic ${b64}` : null;
@@ -44,9 +42,9 @@ async function getBearerViaOAuth() {
   try {
     const form = new URLSearchParams();
     form.set("grant_type", "client_credentials");
-    if (process.env.EXT_USER_LOGIN)     form.set("user_login",    process.env.EXT_USER_LOGIN);
-    if (process.env.EXT_USER_LOGIN_ID)  form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
-    if (process.env.EXT_TPL_GUID)       form.set("tplguid",       process.env.EXT_TPL_GUID);
+    if (process.env.EXT_USER_LOGIN)    form.set("user_login",    process.env.EXT_USER_LOGIN);
+    if (process.env.EXT_USER_LOGIN_ID) form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
+    if (process.env.EXT_TPL_GUID)      form.set("tplguid",       process.env.EXT_TPL_GUID);
 
     const auth = basicHeaderFromEnv(); // base64(clientId:clientSecret)
     const resp = await axios.post(tokenUrl, form, {
@@ -58,6 +56,7 @@ async function getBearerViaOAuth() {
       timeout: 15000,
       validateStatus: () => true,
     });
+
     if (resp.status >= 200 && resp.status < 300 && resp.data?.access_token) {
       return `Bearer ${resp.data.access_token}`;
     }
@@ -90,7 +89,7 @@ export async function authHeaders() {
   };
 }
 
-/* ===================== API calls ===================== */
+/* --------------------------- API calls --------------------------- */
 async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1 }) {
   const { data } = await axios.get(`${base}/orders`, {
     headers,
@@ -125,27 +124,51 @@ export async function fetchOneOrderDetail(orderId) {
   }
 }
 
-/* ===================== DB bootstrap ===================== */
+/* --------------------------- DB bootstrap --------------------------- */
 async function ensureTables(pool) {
+  // Create table if missing
   await pool.request().batch(`
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
+BEGIN
   CREATE TABLE dbo.OrderDetails (
     OrderItemID INT NOT NULL PRIMARY KEY,
     OrderId     INT NULL,
+    CustomerID  INT NOT NULL DEFAULT(0),
     ItemID      VARCHAR(150) NULL,
     Qualifier   VARCHAR(80) NULL,
     OrderedQTY  INT NULL
   );
+END
+`);
 
--- widen if an older, narrower version exists
-IF COL_LENGTH('dbo.OrderDetails','ItemID')    IS NOT NULL AND COL_LENGTH('dbo.OrderDetails','ItemID')    < 150
-  ALTER TABLE dbo.OrderDetails ALTER COLUMN ItemID   VARCHAR(150) NULL;
+  // Ensure CustomerID column exists and is NOT NULL with a default
+  const hasCustomerCol =
+    await pool.request().query(`
+      SELECT 1 AS ok
+      WHERE EXISTS (
+        SELECT 1
+        FROM sys.columns
+        WHERE object_id = OBJECT_ID('dbo.OrderDetails')
+          AND name = 'CustomerID'
+      );
+    `);
+
+  if (!hasCustomerCol.recordset.length) {
+    await pool.request().batch(`
+ALTER TABLE dbo.OrderDetails ADD CustomerID INT NOT NULL CONSTRAINT DF_OrderDetails_CustomerID DEFAULT(0);
+    `);
+  }
+
+  // Widen columns if needed
+  await pool.request().batch(`
+IF COL_LENGTH('dbo.OrderDetails','ItemID') IS NOT NULL AND COL_LENGTH('dbo.OrderDetails','ItemID') < 150
+  ALTER TABLE dbo.OrderDetails ALTER COLUMN ItemID VARCHAR(150) NULL;
 IF COL_LENGTH('dbo.OrderDetails','Qualifier') IS NOT NULL AND COL_LENGTH('dbo.OrderDetails','Qualifier') < 80
   ALTER TABLE dbo.OrderDetails ALTER COLUMN Qualifier VARCHAR(80) NULL;
 `);
 }
 
-/* ============== detail fetcher (only if items are missing) ============== */
+/* --------- fetch details for many orders if items were missing ---------- */
 async function fetchDetailsForMany(orderIds, headers, base, concurrency = 4) {
   const results = [];
   let idx = 0;
@@ -167,7 +190,7 @@ async function fetchDetailsForMany(orderIds, headers, base, concurrency = 4) {
   return results;
 }
 
-/* ===================== MAIN IMPORT (robust) ===================== */
+/* --------------------------- MAIN IMPORT --------------------------- */
 export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {}) {
   const pool = await getPool();
   await ensureTables(pool);
@@ -198,13 +221,22 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
     if (!orders.length) break;
     importedHeaders += orders.length;
 
-    // flatten items from page
+    // Flatten items from page (include CustomerID)
     const flat = [];
     const orderIds = [];
 
     for (const ord of orders) {
       const ro = readOnly(ord);
       const orderId = ro.OrderId ?? ro.orderId ?? ord.OrderId ?? ord.orderId ?? null;
+
+      // derive customerId (NOT NULL in your table)
+      const customerId =
+        ro.customerIdentifier?.id ??
+        ro.CustomerIdentifier?.Id ??
+        ord?.customerIdentifier?.id ??
+        ord?.CustomerIdentifier?.Id ??
+        0;
+
       if (orderId) orderIds.push(orderId);
 
       for (const it of itemsFromOrder(ord)) {
@@ -212,20 +244,21 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
         const orderItemId =
           iro.OrderItemId ?? iro.orderItemId ?? it.orderItemId ?? it.OrderItemId ?? it.id ?? null;
 
-        let sku =
+        const sku =
           it?.itemIdentifier?.sku ??
           it?.ItemIdentifier?.Sku ??
           it?.sku ??
           it?.SKU ??
           null;
 
-        let qualifier = it?.qualifier ?? it?.Qualifier ?? "";
-        const qty     = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
+        const qualifier = it?.qualifier ?? it?.Qualifier ?? "";
+        const qty = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
 
         if (orderItemId && sku) {
           flat.push({
             orderItemId: toInt(orderItemId, null),
             orderId:     toInt(orderId, null),
+            customerId:  toInt(customerId, 0),
             sku:         safeStr(sku, 150),
             qualifier:   safeStr(qualifier, 80) || "",
             qty,
@@ -240,26 +273,33 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
       for (const ord of detailed) {
         const ro = readOnly(ord);
         const orderId = ro.OrderId ?? ro.orderId ?? ord.OrderId ?? ord.orderId ?? null;
+        const customerId =
+          ro.customerIdentifier?.id ??
+          ro.CustomerIdentifier?.Id ??
+          ord?.customerIdentifier?.id ??
+          ord?.CustomerIdentifier?.Id ??
+          0;
 
         for (const it of itemsFromOrder(ord)) {
           const iro = readOnly(it);
           const orderItemId =
             iro.OrderItemId ?? iro.orderItemId ?? it.orderItemId ?? it.OrderItemId ?? it.id ?? null;
 
-          let sku =
+          const sku =
             it?.itemIdentifier?.sku ??
             it?.ItemIdentifier?.Sku ??
             it?.sku ??
             it?.SKU ??
             null;
 
-          let qualifier = it?.qualifier ?? it?.Qualifier ?? "";
-          const qty     = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
+          const qualifier = it?.qualifier ?? it?.Qualifier ?? "";
+          const qty = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty ?? 0, 0);
 
           if (orderItemId && sku) {
             flat.push({
               orderItemId: toInt(orderItemId, null),
               orderId:     toInt(orderId, null),
+              customerId:  toInt(customerId, 0),
               sku:         safeStr(sku, 150),
               qualifier:   safeStr(qualifier, 80) || "",
               qty,
@@ -274,27 +314,27 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200 } = {
     for (const x of flat) if (!byId.has(x.orderItemId)) byId.set(x.orderItemId, x);
     const items = Array.from(byId.values());
 
-    // **no transaction**; insert row-by-row so one bad row doesn’t abort the batch
+    // Upsert row-by-row (no transaction), include CustomerID
     for (const it of items) {
       try {
         await pool.request()
           .input("OrderItemID", sql.Int, it.orderItemId)
           .input("OrderId",     sql.Int, it.orderId ?? null)
+          .input("CustomerID",  sql.Int, it.customerId) // NOT NULL
           .input("ItemID",      sql.VarChar(150), it.sku)
           .input("Qualifier",   sql.VarChar(80),  it.qualifier)
           .input("OrderedQTY",  sql.Int, it.qty)
           .query(`
 IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
   UPDATE dbo.OrderDetails
-     SET OrderId=@OrderId, ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQTY
+     SET OrderId=@OrderId, CustomerID=@CustomerID, ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQTY
    WHERE OrderItemID=@OrderItemID;
 ELSE
-  INSERT INTO dbo.OrderDetails (OrderItemID, OrderId, ItemID, Qualifier, OrderedQTY)
-  VALUES (@OrderItemID, @OrderId, @ItemID, @Qualifier, @OrderedQTY);
+  INSERT INTO dbo.OrderDetails (OrderItemID, OrderId, CustomerID, ItemID, Qualifier, OrderedQTY)
+  VALUES (@OrderItemID, @OrderId, @CustomerID, @ItemID, @Qualifier, @OrderedQTY);
         `);
         upsertedItems++;
       } catch (e) {
-        // capture full details for debugging
         errors.push({
           orderItemId: it.orderItemId,
           message: e.message,
@@ -312,6 +352,5 @@ ELSE
 
   return errors.length
     ? { ok: false, importedHeaders, upsertedItems, errors }
-    : { ok: true, importedHeaders, upsertedItems };
+    : { ok: true,  importedHeaders, upsertedItems };
 }
-
