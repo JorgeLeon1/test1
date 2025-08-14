@@ -5,62 +5,65 @@ import { getPool, sql } from "./db/mssql.js";
 const TIMEOUT = 20000;
 const CONCURRENCY = Number(process.env.EXT_FETCH_DETAILS_CONCURRENCY || 5);
 
-// ---------- helpers ----------
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const nowMs = () => Date.now();
 
+// -------- list helpers --------
 const listify = (data) => {
   if (Array.isArray(data)) return data;
-  const candidates = [
-    "ResourceList", // your legacy list key
-    "data","results","Results","items","Items","orders","Orders","records","Records","value","Value","list","List",
-  ];
-  for (const k of candidates) if (Array.isArray(data?.[k])) return data[k];
+  if (Array.isArray(data?.ResourceList)) return data.ResourceList; // legacy list
+  if (Array.isArray(data?.data)) return data.data;
+  // try any first array value as last resort
   if (data && typeof data === "object") {
     for (const v of Object.values(data)) if (Array.isArray(v)) return v;
   }
   return [];
 };
 
-function extractItems(order) {
-  if (!order || typeof order !== "object") return [];
+const getOrderId = (o) =>
+  o?.ReadOnly?.OrderId ?? o?.OrderId ?? o?.orderId ?? o?.Id ?? o?.ID ?? o?.id ?? null;
+
+// -------- item helpers --------
+function extractItems(payload) {
+  if (!payload || typeof payload !== "object") return [];
   const cands = [
-    order.items, order.Items,
-    order.OrderLineItems, order.Lines,
-    order.OrderDetails, order.Details?.OrderLineItems,
-    order.Detail?.OrderLineItems
+    payload.items, payload.Items,
+    payload.OrderLineItems, payload.Lines,
+    payload.OrderDetails, payload.Details?.OrderLineItems,
+    payload.Detail?.OrderLineItems
   ].filter(Boolean);
   for (const c of cands) if (Array.isArray(c)) return c;
+  // sometimes items wrapped under ResourceList for detail endpoint
+  if (Array.isArray(payload?.ResourceList)) return payload.ResourceList;
   return [];
 }
 
 function mapItemForSql(it) {
   const orderItemId =
-    it?.id ?? it?.orderItemId ?? it?.OrderLineItemId ?? it?.OrderItemID ?? it?.OrderItemId ?? null;
+    it?.OrderLineItemId ?? it?.OrderItemID ?? it?.OrderItemId ?? it?.orderItemId ?? it?.id ?? null;
 
   const sku =
-    it?.sku ?? it?.SKU ?? it?.ItemId ?? it?.ItemID ?? it?.ItemCode ??
+    it?.SKU ?? it?.sku ?? it?.ItemID ?? it?.ItemId ?? it?.ItemCode ??
     it?.ItemIdentifier?.Sku ?? it?.ItemIdentifier?.SKU ?? it?.ItemIdentifier?.ItemCode ?? "";
 
-  const orderedQty = Number(it?.quantity ?? it?.Quantity ?? it?.Qty ?? it?.OrderedQty ?? 0);
+  const orderedQty = Number(
+    it?.OrderedQty ?? it?.Quantity ?? it?.Qty ?? it?.quantity ?? 0
+  );
 
   const qualifier =
-    it?.qualifier ?? it?.Qualifier ?? it?.UOM ??
+    it?.Qualifier ?? it?.qualifier ?? it?.UOM ??
     (it?.UnitOfMeasure?.Name || it?.UnitOfMeasure) ?? "";
 
   return { orderItemId, sku, orderedQty, qualifier };
 }
 
-function getOrderId(o) {
-  return o?.ReadOnly?.OrderId ?? o?.OrderId ?? o?.orderId ?? o?.Id ?? o?.ID ?? o?.id ?? null;
-}
+// -------- auth --------
+let tokenCache = { token: null, exp: 0 };
 
-// ---------------- AUTH (Basic or Bearer) ----------------
-let tokenCache = { token: null, exp: 0, winner: null };
-
-export async function getAccessToken() {
+async function getAccessToken() {
   if (tokenCache.token && nowMs() < tokenCache.exp - 60_000) return tokenCache.token;
 
+  // Basic (client_id:client_secret) → Bearer token
   const b64 =
     process.env.EXT_BASIC_AUTH_B64 ||
     (process.env.EXT_CLIENT_ID && process.env.EXT_CLIENT_SECRET
@@ -69,64 +72,46 @@ export async function getAccessToken() {
 
   if (!b64) throw new Error("Bearer mode: missing EXT_BASIC_AUTH_B64 or EXT_CLIENT_ID/EXT_CLIENT_SECRET");
 
+  const tokenEndpoints = [
+    process.env.EXT_TOKEN_URL,
+    "https://box.secure-wms.com/oauth/token",
+    "https://secure-wms.com/oauth/token",
+    "https://secure-wms.com/AuthServer/api/Token",
+    "https://box.secure-wms.com/AuthServer/api/Token"
+  ].filter(Boolean);
+
   const userLogin   = process.env.EXT_USER_LOGIN || "";
   const userLoginId = process.env.EXT_USER_LOGIN_ID;
   const tplguid     = process.env.EXT_TPL_GUID;
-  const tpl         = process.env.EXT_TPL || process.env.EXT_TPL_ID;
+  const bodyBase = { grant_type: "client_credentials" };
+  if (userLoginId) bodyBase.user_login_id = String(userLoginId); else bodyBase.user_login = userLogin;
+  if (tplguid) bodyBase.tplguid = String(tplguid);
 
-  const endpoints = [];
-  if (process.env.EXT_TOKEN_URL) endpoints.push({ url: trimBase(process.env.EXT_TOKEN_URL), style: "form" });
-  endpoints.push(
-    { url: "https://box.secure-wms.com/oauth/token", style: "form" },
-    { url: "https://secure-wms.com/oauth/token",     style: "form" },
-    { url: "https://secure-wms.com/AuthServer/api/Token", style: "json" },
-    { url: "https://box.secure-wms.com/AuthServer/api/Token", style: "json" }
-  );
-
-  const userKeys = userLoginId ? [["user_login_id", String(userLoginId)], ["user_login", String(userLogin)]] 
-                               : [["user_login", String(userLogin)]];
-  const tplKeys  = tplguid ? [["tplguid", String(tplguid)], ...(tpl ? [["tpl", String(tpl)]] : [])]
-                           : (tpl ? [["tpl", String(tpl)]] : [["tpl", ""]]);
-
-  const attempts = [];
-  for (const ep of endpoints) {
-    for (const [uKey, uVal] of userKeys) {
-      for (const [tKey, tVal] of tplKeys) {
-        try {
-          let data, headers;
-          if (ep.style === "form") {
-            const form = new URLSearchParams({ grant_type: "client_credentials", [uKey]: uVal });
-            if (tVal) form.append(tKey, tVal);
-            data = form;
-            headers = { "Content-Type": "application/x-www-form-urlencoded" };
-          } else {
-            const body = { grant_type: "client_credentials", [uKey]: uVal };
-            if (tVal) body[tKey] = tVal;
-            data = body;
-            headers = { "Content-Type": "application/json" };
-          }
-
-          const r = await axios.post(ep.url, data, {
-            headers: { ...headers, Accept: "application/json", Authorization: `Basic ${b64}` },
-            timeout: TIMEOUT,
-          });
-          const { access_token, expires_in = 1800 } = r.data || {};
-          if (!access_token) throw new Error(`No access_token from ${ep.url}`);
-          tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000, winner: { ...ep, uKey, tKey } };
-          if (process.env.LOG_TOKEN_DEBUG === "true") console.log("[OAuth winner]", tokenCache.winner);
-          return access_token;
-        } catch (e) {
-          attempts.push({ url: ep.url, style: ep.style, uKey, tKey, status: e.response?.status || null, data: e.response?.data || String(e.message) });
-        }
-      }
+  let lastErr;
+  for (const url of tokenEndpoints) {
+    try {
+      const isJson = /AuthServer\/api\/Token$/.test(url);
+      const data = isJson ? bodyBase : new URLSearchParams(bodyBase);
+      const headers = {
+        Accept: "application/json",
+        Authorization: `Basic ${b64}`,
+        "Content-Type": isJson ? "application/json" : "application/x-www-form-urlencoded",
+      };
+      const r = await axios.post(url, data, { headers, timeout: TIMEOUT });
+      const { access_token, expires_in = 1800 } = r.data || {};
+      if (!access_token) throw new Error(`No access_token from ${url}`);
+      tokenCache = { token: access_token, exp: nowMs() + expires_in * 1000 };
+      return access_token;
+    } catch (e) {
+      lastErr = e;
     }
   }
-  throw new Error("All token endpoints failed: " + JSON.stringify(attempts.slice(0, 6), null, 2));
+  throw lastErr || new Error("OAuth token failed (no endpoints worked)");
 }
 
 export async function authHeaders() {
   const mode = (process.env.EXT_AUTH_MODE || "basic").toLowerCase();
-  const h = { Accept: "application/json", "Content-Type": "application/json" };
+  const h = { Accept: "application/json" };
 
   if (mode === "bearer") {
     const token = await getAccessToken();
@@ -138,7 +123,7 @@ export async function authHeaders() {
     h.Authorization = `Basic ${b64}`;
   }
 
-  // legacy scoping prefers headers (no query params)
+  // legacy scoping prefers headers
   if (process.env.EXT_CUSTOMER_IDS) {
     h["CustomerIds"] = process.env.EXT_CUSTOMER_IDS;
     h["CustomerIDs"] = process.env.EXT_CUSTOMER_IDS;
@@ -155,32 +140,28 @@ export async function authHeaders() {
   return h;
 }
 
-// ---------- per-order details ----------
+// -------- detail fetcher (tries several URLs/expansions) --------
 async function fetchOrderDetails(base, headers, orderId) {
   const urls = [
-    `${base}/orders/${orderId}`,                 // legacy details
-    `${base}/api/v1/orders/${orderId}`,         // v1 details
+    `${base}/orders/${orderId}`,
+    `${base}/orders/${orderId}/details`,
+    `${base}/orders/${orderId}/items`,
+    `${base}/api/v1/orders/${orderId}`,
+    `${base}/api/v1/orders/${orderId}/items`,
+  ];
+  const paramsList = [
+    undefined,
+    { expand: "OrderLineItems,Items,Details" },
   ];
 
-  // Try plain first; if needed, try with expand hints that some tenants accept
-  const attempts = [];
   for (const url of urls) {
-    // A) no params
-    try {
-      const r = await axios.get(url, { headers, timeout: TIMEOUT });
-      return r.data;
-    } catch (e) {
-      attempts.push({ url, status: e.response?.status || null });
-    }
-    // B) with common expand keys (best-effort; harmless if ignored)
-    try {
-      const r = await axios.get(url, { headers, params: { expand: "OrderLineItems,Items,Details" }, timeout: TIMEOUT });
-      return r.data;
-    } catch (e) {
-      attempts.push({ url, status: e.response?.status || null });
+    for (const params of paramsList) {
+      try {
+        const r = await axios.get(url, { headers, params, timeout: TIMEOUT });
+        return r.data;
+      } catch (_e) { /* try next */ }
     }
   }
-  // If nothing worked, return null to skip this order silently
   return null;
 }
 
@@ -201,97 +182,123 @@ async function runPool(ids, worker) {
   return results;
 }
 
-// ---------------- Fetch headers, then details → upsert items ----------------
-export async function fetchAndUpsertOrders({ modifiedSince, status, pageSize = 100 } = {}) {
+// -------- main: fetch headers → details → upsert items --------
+export async function fetchAndUpsertOrders({ pageSize = 100, modifiedSince, status } = {}) {
   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
   const pool = await getPool();
 
-  // 1) pull header list (legacy first, no query params)
-  const endpoints = [
-    { url: `${base}/orders`, isLegacy: true },
-    { url: `${base}/api/v1/orders`, isLegacy: false },
-    { url: `${base}/api/orders`, isLegacy: false },
+  // ensure table exists & has OrderId
+  await pool.request().batch(`
+IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.OrderDetails (
+    OrderItemID INT NULL,
+    OrderId     INT NULL,
+    ItemID      VARCHAR(100) NULL,
+    Qualifier   VARCHAR(50) NULL,
+    OrderedQTY  INT NULL
+  );
+END
+ELSE
+BEGIN
+  IF COL_LENGTH('dbo.OrderDetails','OrderId') IS NULL
+    ALTER TABLE dbo.OrderDetails ADD OrderId INT NULL;
+END
+  `);
+
+  // 1) Headers (legacy first; no pagination params)
+  const listUrls = [
+    { url: `${base}/orders`, legacy: true },
+    { url: `${base}/api/v1/orders`, legacy: false },
+    { url: `${base}/api/orders`, legacy: false },
   ];
-
   let orders = [];
-  let lastErr = null;
-  const headers = await authHeaders();
-
-  for (const ep of endpoints) {
+  for (const u of listUrls) {
     try {
-      const resp = await axios.get(ep.url, {
+      const resp = await axios.get(u.url, {
         headers,
-        ...(ep.isLegacy ? {} : {
-          params: {
-            page: 1,
-            pageSize,
-            ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}),
-            ...(status ? { status } : {}),
-          }
-        }),
+        ...(u.legacy ? {} : { params: { page: 1, pageSize, ...(modifiedSince ? { modifiedDateStart: modifiedSince } : {}), ...(status ? { status } : {}) } }),
         timeout: TIMEOUT,
       });
       orders = listify(resp.data);
-      lastErr = null;
-      break;
-    } catch (e) {
-      lastErr = e;
-      const s = e.response?.status;
-      if (![400, 401, 403, 404].includes(s)) throw e;
-    }
+      if (orders.length) break;
+    } catch (_e) { /* try next */ }
   }
+  const importedHeaders = orders.length;
 
-  if (lastErr) {
-    console.error("[Extensiv /orders error]", lastErr.response?.status, lastErr.response?.data || lastErr.message);
-    throw lastErr;
-  }
-
-  const importedHeaders = Array.isArray(orders) ? orders.length : 0;
   if (!importedHeaders) return { importedHeaders: 0, upsertedItems: 0 };
 
-  // 2) fetch details for each header to get line items
-  const orderIds = orders.map(getOrderId).filter((x) => x != null);
-  const detailsPayloads = await runPool(orderIds, (id) => fetchOrderDetails(base, headers, id));
+  // 2) Details (to get items)
+  const headerIds = orders.map(getOrderId).filter((x) => x != null);
+  const detailPayloads = await runPool(headerIds, (id) => fetchOrderDetails(base, headers, id));
 
-  // 3) upsert items
+  // 3) Upsert items (supports null OrderItemID via composite key)
   let upsertedItems = 0;
   const tx = new sql.Transaction(pool);
   await tx.begin();
   try {
     const req = new sql.Request(tx);
-    for (const p of detailsPayloads) {
+
+    for (let i = 0; i < detailPayloads.length; i++) {
+      const p = detailPayloads[i];
       if (!p) continue;
+
+      const orderId = getOrderId(p) ?? headerIds[i];
       const items = extractItems(p);
       if (!items.length) continue;
 
       for (const it of items) {
         const { orderItemId, sku, orderedQty, qualifier } = mapItemForSql(it);
-        if (orderItemId == null && !sku) continue;
+        if (!sku) continue;
 
         await req
           .input("OrderItemID", sql.Int, orderItemId)
-          .input("ItemID", sql.VarChar(100), sku)
-          .input("Qualifier", sql.VarChar(50), qualifier)
-          .input("OrderedQty", sql.Int, orderedQty)
+          .input("OrderId",     sql.Int, orderId ?? null)
+          .input("ItemID",      sql.VarChar(100), sku)
+          .input("Qualifier",   sql.VarChar(50), qualifier || "")
+          .input("OrderedQty",  sql.Int, orderedQty)
           .query(`
-            MERGE [dbo].[OrderDetails] AS t
-            USING (SELECT @OrderItemID AS OrderItemID) s
-            ON t.OrderItemID = s.OrderItemID
-            WHEN MATCHED THEN 
-              UPDATE SET ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQty
-            WHEN NOT MATCHED THEN 
-              INSERT (OrderItemID, ItemID, Qualifier, OrderedQTY)
-              VALUES (@OrderItemID, @ItemID, @Qualifier, @OrderedQty);
+IF @OrderItemID IS NOT NULL
+BEGIN
+  MERGE dbo.OrderDetails AS t
+  USING (SELECT @OrderItemID AS OrderItemID) s
+  ON (t.OrderItemID = s.OrderItemID)
+  WHEN MATCHED THEN
+    UPDATE SET ItemID=@ItemID, Qualifier=@Qualifier, OrderedQTY=@OrderedQty, OrderId = @OrderId
+  WHEN NOT MATCHED THEN
+    INSERT (OrderItemID, OrderId, ItemID, Qualifier, OrderedQTY)
+    VALUES (@OrderItemID, @OrderId, @ItemID, @Qualifier, @OrderedQty);
+END
+ELSE
+BEGIN
+  UPDATE dbo.OrderDetails
+     SET OrderedQTY=@OrderedQty, OrderId = @OrderId
+   WHERE ISNULL(OrderId,-1)=ISNULL(@OrderId,-1)
+     AND ItemID=@ItemID
+     AND ISNULL(Qualifier,'')=ISNULL(@Qualifier,'');
+  IF @@ROWCOUNT = 0
+    INSERT (OrderItemID, OrderId, ItemID, Qualifier, OrderedQTY)
+    VALUES (NULL, @OrderId, @ItemID, @Qualifier, @OrderedQty);
+END
           `);
+
         upsertedItems++;
       }
     }
+
     await tx.commit();
   } catch (e) {
     await tx.rollback();
-    console.error("[SQL upsert error]", e);
     throw e;
   }
 
   return { importedHeaders, upsertedItems };
+}
+
+// --- optional: expose a single-order detail fetcher for debugging routes ---
+export async function fetchOneOrderDetail(orderId) {
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
+  return await fetchOrderDetails(base, headers, orderId);
 }
