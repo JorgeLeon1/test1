@@ -1,171 +1,304 @@
-// helpers (keep if you already have similar ones)
-const trimBase = (u) => (u || "").replace(/\/+$/, "");
-const s = (v, max) => (v == null ? null : String(v).normalize("NFC").slice(0, max));
-const toInt = (v, def = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : def);
+// src/app/services/extensivClient.js
+import axios from "axios";
 
-function ro(o) { return o?.readOnly || o?.ReadOnly || {}; }
+// ---- Robust DB import: works with either named or default exports
+import * as dbMod from "./db/mssql.js";
+const db = dbMod?.default ?? dbMod;
+const getPool = db?.getPool;
+const sql = db?.sql;
+
+if (typeof getPool !== "function" || !sql) {
+  throw new Error("DB module does not export getPool/sql (services/db/mssql.js).");
+}
+
+/* --------------------------- small helpers --------------------------- */
+const trimBase = (u) => (u || "").replace(/\/+$/, "");
+const toInt = (v, d = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : d);
+const s = (v, max = 255) => (v == null ? "" : String(v).normalize("NFC").slice(0, max));
+
+// pull first array from any of the shapes Extensiv returns
 function firstArray(obj) {
   if (Array.isArray(obj)) return obj;
   if (Array.isArray(obj?.ResourceList)) return obj.ResourceList;
-  const hal = obj?._embedded?.["http://api.3plCentral.com/rels/orders/order"];
-  if (Array.isArray(hal)) return hal;
+  if (Array.isArray(obj?._embedded?.["http://api.3plCentral.com/rels/orders/order"])) {
+    return obj._embedded["http://api.3plCentral.com/rels/orders/order"];
+  }
   if (Array.isArray(obj?.data)) return obj.data;
   for (const v of Object.values(obj || {})) if (Array.isArray(v)) return v;
   return [];
 }
+const ro = (o) => o?.readOnly || o?.ReadOnly || {};
 function itemsFromOrder(ord) {
   const em = ord?._embedded;
-  if (em && Array.isArray(em["http://api.3plCentral.com/rels/orders/item"]))
+  if (em && Array.isArray(em["http://api.3plCentral.com/rels/orders/item"])) {
     return em["http://api.3plCentral.com/rels/orders/item"];
+  }
   if (Array.isArray(ord?.OrderItems)) return ord.OrderItems;
   if (Array.isArray(ord?.Items)) return ord.Items;
   return [];
 }
 
-async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1 }) {
-  const { data } = await axios.get(`${base}/orders`, {
-    headers,
-    params: { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" },
-    timeout: 30000,
-  });
+/* ------------------------------ auth ------------------------------ */
+function basicHeaderFromEnv() {
+  const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
+  return b64 ? `Basic ${b64}` : null;
+}
+
+async function getBearerViaOAuth() {
+  const tokenUrl = process.env.EXT_TOKEN_URL;
+  if (!tokenUrl) return null;
+  try {
+    const form = new URLSearchParams();
+    form.set("grant_type", "client_credentials");
+    if (process.env.EXT_USER_LOGIN) form.set("user_login", process.env.EXT_USER_LOGIN);
+    if (process.env.EXT_USER_LOGIN_ID) form.set("user_login_id", process.env.EXT_USER_LOGIN_ID);
+    if (process.env.EXT_TPL_GUID) form.set("tplguid", process.env.EXT_TPL_GUID);
+
+    const auth = basicHeaderFromEnv(); // base64(clientId:clientSecret)
+    const r = await axios.post(tokenUrl, form, {
+      headers: {
+        Authorization: auth || "",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+    if (r.status >= 200 && r.status < 300 && r.data?.access_token) {
+      return `Bearer ${r.data.access_token}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function authHeaders() {
+  const mode = (process.env.EXT_AUTH_MODE || "").toLowerCase();
+  if (mode === "bearer") {
+    const bearer = await getBearerViaOAuth();
+    if (bearer) {
+      return {
+        Authorization: bearer,
+        Accept: "application/hal+json, application/json",
+        "Content-Type": "application/hal+json; charset=utf-8",
+      };
+    }
+  }
+  const basic = basicHeaderFromEnv();
+  if (!basic) {
+    throw new Error(
+      "No auth configured: set EXT_BASIC_AUTH_B64 or EXT_TOKEN_URL (+ client id/secret)."
+    );
+  }
+  return {
+    Authorization: basic,
+    Accept: "application/hal+json, application/json",
+    "Content-Type": "application/hal+json; charset=utf-8",
+  };
+}
+
+/* ------------------------------ API ------------------------------ */
+async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1, openOnly = true }) {
+  // Restrict to OPEN & UNALLOCATED in the API if possible
+  const params = { pgsiz, pgnum, detail: "OrderItems", itemdetail: "All" };
+  if (openOnly) {
+    // status 0 = Open; fullyAllocated=false
+    params.rql = "readOnly.status==0;readOnly.fullyAllocated==false";
+  }
+  const { data } = await axios.get(`${base}/orders`, { headers, params, timeout: 30000 });
   return data;
 }
 
-/* build records for the dbo.OrderDetails columns you showed */
-function buildRowsForOrderDetails(ord) {
-  const R = [];
-  const r = ro(ord);
-  // Only open / not closed orders
-  if (r.isClosed === true) return R;
+export async function fetchOneOrderDetail(orderId) {
+  const base = trimBase(
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+  );
+  const headers = await authHeaders();
 
-  const orderId = r.orderId ?? r.OrderId ?? ord.orderId ?? ord.OrderId;
-  const cust    = r.customerIdentifier || ord.customerIdentifier || {};
-  const refNum  = ord.referenceNum ?? "";
-
-  for (const it of itemsFromOrder(ord)) {
-    const ir = ro(it);
-    // Only unallocated lines
-    if (ir.fullyAllocated === true) continue;
-
-    const orderItemId = ir.orderItemId ?? ir.OrderItemId ?? it.orderItemId ?? it.OrderItemId;
-    const sku         = it?.itemIdentifier?.sku ?? it?.ItemIdentifier?.Sku ?? it?.sku ?? it?.SKU;
-    const itemId      = it?.itemIdentifier?.id  ?? it?.ItemIdentifier?.Id  ?? null;
-    const unit        = ir.unitIdentifier || it.unitIdentifier || {};
-    const qualifier   = it?.qualifier ?? it?.Qualifier ?? "";
-    const qty         = toInt(it?.qty ?? it?.Qty ?? it?.OrderedQty ?? it?.orderedQty, 0);
-
-    // essential keys must exist
-    if (!orderItemId || !orderId || !sku) continue;
-
-    R.push({
-      OrderItemID:  toInt(orderItemId, 0),
-      OrderID:      toInt(orderId, 0),
-      CustomerName: s(cust.name, 200) || "",
-      CustomerID:   toInt(cust.id, 0),
-      ItemID:       s(itemId ?? sku, 150),   // fallback to SKU if numeric id missing
-      SKU:          s(sku, 150),
-      UnitID:       toInt(unit.id, 0),
-      UnitName:     s(unit.name, 80) || "",
-      Qualifier:    s(qualifier, 80) || "",
-      OrderedQTY:   toInt(qty, 0),
-      ReferenceNum: s(refNum, 120) || "",
+  try {
+    const { data } = await axios.get(`${base}/orders`, {
+      headers,
+      params: {
+        pgsiz: 1,
+        pgnum: 1,
+        detail: "OrderItems",
+        itemdetail: "All",
+        rql: `readOnly.orderId==${orderId}`,
+      },
+      timeout: 20000,
     });
+    const list = firstArray(data);
+    if (list?.[0]) return list[0];
+  } catch {}
+  try {
+    const page = await listOrdersPage({ base, headers, pgsiz: 100, pgnum: 1, openOnly: false });
+    const list = firstArray(page);
+    return list.find((o) => (ro(o).orderId ?? ro(o).OrderId ?? o.orderId ?? o.OrderId) === orderId) || null;
+  } catch {
+    return null;
   }
-  return R;
 }
 
-/* single-row upsert with exact column names from your table */
-async function upsertOrderDetailExact(pool, rec) {
+/* -------- discover existing columns so we only write what exists -------- */
+async function getExistingOrderDetailsColumns(pool) {
+  const q = await pool
+    .request()
+    .query("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')");
+  return new Set(q.recordset.map((r) => r.name));
+}
+
+/* ------- build a dynamic upsert using only columns that actually exist ---- */
+async function upsertOrderDetail(pool, cols, rec) {
+  if (!rec.OrderItemID) return;
+
   const req = pool.request();
-  req.input("OrderItemID",  sql.Int,         rec.OrderItemID);
-  req.input("OrderID",      sql.Int,         rec.OrderID);
-  req.input("CustomerName", sql.VarChar(200),rec.CustomerName);
-  req.input("CustomerID",   sql.Int,         rec.CustomerID);
-  req.input("ItemID",       sql.VarChar(150),rec.ItemID);
-  req.input("SKU",          sql.VarChar(150),rec.SKU);
-  req.input("UnitID",       sql.Int,         rec.UnitID);
-  req.input("UnitName",     sql.VarChar(80), rec.UnitName);
-  req.input("Qualifier",    sql.VarChar(80), rec.Qualifier);
-  req.input("OrderedQTY",   sql.Int,         rec.OrderedQTY);
-  req.input("ReferenceNum", sql.VarChar(120),rec.ReferenceNum);
+  req.input("OrderItemID", sql.Int, rec.OrderItemID);
 
-  await req.query(`
+  const fieldDefs = [
+    ["OrderID", "OrderID", sql.Int, toInt(rec.OrderId, 0)], // NOTE: DB col is OrderID (capital D), map from OrderId
+    ["OrderId", "OrderId", sql.Int, toInt(rec.OrderId, 0)], // if your table used OrderId (lower d)
+    ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
+    ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
+    ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
+    ["ItemID", "ItemID", sql.VarChar(150), s(rec.SKU, 150)], // mirror SKU into ItemID if present
+    ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
+    ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
+    ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
+    ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
+    ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
+    ["ShipToAddress1", "ShipToAddress1", sql.VarChar(255), s(rec.ShipToAddress1, 255)],
+  ];
+
+  const active = fieldDefs.filter(([col]) => cols.has(col));
+  active.forEach(([col, param, type, val]) => req.input(param, type, val));
+
+  const setClause = active.map(([col, param]) => `${col}=@${param}`).join(", ");
+  const insertCols = ["OrderItemID", ...active.map(([col]) => col)].join(", ");
+  const insertVals = ["@OrderItemID", ...active.map(([, p]) => `@${p}`)].join(", ");
+
+  const sqlText = `
 IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
-  UPDATE dbo.OrderDetails
-     SET OrderID=@OrderID,
-         CustomerName=@CustomerName,
-         CustomerID=@CustomerID,
-         ItemID=@ItemID,
-         SKU=@SKU,
-         UnitID=@UnitID,
-         UnitName=@UnitName,
-         Qualifier=@Qualifier,
-         OrderedQTY=@OrderedQTY,
-         ReferenceNum=@ReferenceNum
-   WHERE OrderItemID=@OrderItemID;
+  UPDATE dbo.OrderDetails SET ${setClause} WHERE OrderItemID=@OrderItemID;
 ELSE
-  INSERT INTO dbo.OrderDetails
-    (OrderItemID, OrderID, CustomerName, CustomerID, ItemID, SKU, UnitID, UnitName, Qualifier, OrderedQTY, ReferenceNum)
-  VALUES
-    (@OrderItemID,@OrderID,@CustomerName,@CustomerID,@ItemID,@SKU,@UnitID,@UnitName,@Qualifier,@OrderedQTY,@ReferenceNum);
-`);
+  INSERT INTO dbo.OrderDetails (${insertCols}) VALUES (${insertVals});
+`;
+  await req.query(sqlText);
 }
 
-/* ============ MAIN: import only open + not-fully-allocated ============ */
-export async function fetchAndUpsertOrders({ maxPages = 20, pageSize = 200 } = {}) {
-  const pool    = await getPool();
-  const base    = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+/* ----------------------------- MAIN IMPORT ----------------------------- */
+export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200, openOnly = true } = {}) {
+  const pool = await getPool();
+  const existingCols = await getExistingOrderDetailsColumns(pool);
+
+  const base = trimBase(
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+  );
   const headers = await authHeaders();
 
   let importedHeaders = 0;
-  let upsertedItems   = 0;
-  const errors        = [];
+  let upsertedItems = 0;
+  const errors = [];
 
   for (let pg = 1; pg <= maxPages; pg++) {
     let pageData;
     try {
-      pageData = await listOrdersPage({ base, headers, pgsiz: pageSize, pgnum: pg });
+      pageData = await listOrdersPage({ base, headers, pgsiz: pageSize, pgnum: pg, openOnly });
     } catch (e) {
-      return { ok: false, importedHeaders, upsertedItems, message: `GET /orders failed page ${pg}: ${e.message}` };
+      const st = e.response?.status;
+      const dt = e.response?.data;
+      return {
+        ok: false,
+        status: st || 500,
+        message: `Orders GET failed (page ${pg})`,
+        data: typeof dt === "string" ? dt : dt || String(e.message),
+      };
     }
 
-    const allOrders = firstArray(pageData);
-    if (!allOrders.length) break;
-
-    // keep only open + NOT fully allocated orders
-    const orders = allOrders.filter(o => {
-      const r = ro(o);
-      return r.isClosed !== true && r.fullyAllocated !== true;
-    });
-
+    const orders = firstArray(pageData);
+    if (!orders.length) break;
     importedHeaders += orders.length;
 
-    // flatten rows for this page
-    const rows = [];
-    for (const ord of orders) rows.push(...buildRowsForOrderDetails(ord));
+    for (const ord of orders) {
+      const R = ro(ord);
+      const orderId = toInt(R.orderId ?? R.OrderId ?? ord.orderId ?? ord.OrderId, 0);
 
-    // de-dupe by OrderItemID
-    const seen = new Set();
-    const unique = rows.filter(r => {
-      if (seen.has(r.OrderItemID)) return false;
-      seen.add(r.OrderItemID);
-      return true;
-    });
+      // order-level fields
+      const customerId = toInt(R.customerIdentifier?.id, 0);
+      const customerName = s(R.customerIdentifier?.name, 200);
+      const referenceNum = s(ord.referenceNum, 120);
+      const shipToAddress1 = s(ord.shipTo?.address1, 255);
 
-    // upsert one-by-one so a bad row doesn’t nuke the batch
-    for (const rec of unique) {
-      try {
-        await upsertOrderDetailExact(pool, rec);
-        upsertedItems++;
-      } catch (e) {
-        errors.push({ orderItemId: rec.OrderItemID, message: e.message, number: e.number, code: e.code, state: e.state, class: e.class, lineNumber: e.lineNumber });
+      let lines = itemsFromOrder(ord);
+      if (!lines.length) {
+        try {
+          const detail = await fetchOneOrderDetail(orderId);
+          lines = itemsFromOrder(detail);
+        } catch {
+          lines = [];
+        }
+      }
+
+      for (const it of lines) {
+        const IR = ro(it);
+        const orderItemId = toInt(IR.orderItemId ?? IR.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0);
+        const sku = s(
+          it?.itemIdentifier?.sku ??
+            it?.ItemIdentifier?.Sku ??
+            it?.sku ??
+            it?.SKU ??
+            "",
+          150
+        );
+        const unitId = toInt(IR.unitIdentifier?.id, 0);
+        const unitName = s(IR.unitIdentifier?.name, 80);
+        const qualifier = s(it?.qualifier ?? it?.Qualifier ?? "", 80);
+        const qty = toInt(it?.qty ?? it?.Qty ?? it?.orderedQty ?? it?.OrderedQty, 0);
+
+        if (!orderItemId) continue;
+
+        const rec = {
+          OrderItemID: orderItemId,
+          OrderId: orderId,
+          CustomerID: customerId,
+          CustomerName: customerName,
+          SKU: sku,
+          Qualifier: qualifier,
+          OrderedQTY: qty,
+          UnitID: unitId,
+          UnitName: unitName,
+          ReferenceNum: referenceNum,
+          ShipToAddress1: shipToAddress1,
+        };
+
+        try {
+          await upsertOrderDetail(pool, existingCols, rec);
+          upsertedItems++;
+        } catch (e) {
+          errors.push({
+            orderItemId,
+            message: e.message,
+            number: e.number,
+            code: e.code,
+            state: e.state,
+            class: e.class,
+            lineNumber: e.lineNumber,
+          });
+        }
       }
     }
 
-    if (allOrders.length < pageSize) break; // last page
+    if (orders.length < pageSize) break;
   }
 
   return errors.length
     ? { ok: false, importedHeaders, upsertedItems, errors }
-    : { ok: true,  importedHeaders, upsertedItems };
+    : { ok: true, importedHeaders, upsertedItems };
 }
+
+// Also export a default for safer importing from routes
+export default {
+  authHeaders,
+  fetchOneOrderDetail,
+  fetchAndUpsertOrders,
+};
