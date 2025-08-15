@@ -1,0 +1,214 @@
+<!-- public/alloc-single.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Single Order Allocation</title>
+<style>
+  body{font:14px system-ui,Segoe UI,Arial,sans-serif;background:#f8fafc;margin:24px}
+  h1{color:#0f766e;margin:.2rem 0 1rem}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:.5rem 0 1rem}
+  input[type="number"]{padding:.45rem .6rem;border:1px solid #cbd5e1;border-radius:6px;width:220px}
+  button{background:#10b981;color:#fff;border:none;border-radius:6px;padding:.55rem .9rem;cursor:pointer}
+  button.secondary{background:#3b82f6}
+  button.warn{background:#6b7280}
+  table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.05);margin:1rem 0}
+  th,td{padding:.5rem .75rem;border-bottom:1px solid #e5e7eb;text-align:left}
+  thead{background:#e5e7eb}
+  .muted{color:#6b7280}
+  .ok{color:#065f46}
+  .err{color:#991b1b}
+  .stack{display:grid;gap:12px}
+</style>
+</head>
+<body>
+  <h1>Single Order Allocation</h1>
+
+  <div class="row">
+    <label for="orderId">Order ID</label>
+    <input type="number" id="orderId" min="1" placeholder="e.g. 123456"/>
+    <button class="secondary" id="fetchBtn">Fetch Order</button>
+    <button class="warn" id="pushBtn" disabled>Push Allocations to Extensiv</button>
+  </div>
+
+  <div id="status" class="muted"></div>
+
+  <div class="stack">
+    <div>
+      <h3>Order Lines</h3>
+      <div class="muted" id="linesHint">Fetch an order to see lines.</div>
+      <table id="linesTbl" style="display:none">
+        <thead>
+          <tr>
+            <th style="width:48px;">Select</th>
+            <th>OrderItemID</th><th>OrderID</th><th>SKU</th><th>Qualifier</th><th>Ordered</th>
+          </tr>
+        </thead>
+        <tbody id="linesBody"></tbody>
+      </table>
+      <button id="allocBtn" disabled>Run SQL Allocation (selected)</button>
+    </div>
+
+    <div>
+      <h3>Matching Inventory</h3>
+      <div class="muted" id="invHint">Inventory for this order’s SKUs appears here.</div>
+      <table id="invTbl" style="display:none">
+        <thead>
+          <tr>
+            <th>ItemID</th><th>Qualifier</th><th>ReceiveItemID</th><th>AvailableQTY</th><th>ReceivedQty</th><th>Location</th>
+          </tr>
+        </thead>
+        <tbody id="invBody"></tbody>
+      </table>
+    </div>
+
+    <div>
+      <h3>Current SuggAlloc (this order)</h3>
+      <div class="muted" id="saHint">Allocate to see suggestions.</div>
+      <table id="saTbl" style="display:none">
+        <thead>
+          <tr>
+            <th>OrderItemID</th><th>ReceiveItemID</th><th>SuggAllocQty</th>
+          </tr>
+        </thead>
+        <tbody id="saBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+const $ = (id)=>document.getElementById(id);
+let currentOrderId = null;
+let currentLines = [];
+
+function setStatus(msg, cls='muted'){
+  const el = $('status');
+  el.className = cls;
+  el.textContent = msg || '';
+}
+
+function renderLines(lines){
+  const tb = $('linesBody');
+  if (!lines?.length){
+    $('linesTbl').style.display='none';
+    $('linesHint').style.display='block';
+    $('allocBtn').disabled = true;
+    return;
+  }
+  $('linesHint').style.display='none';
+  $('linesTbl').style.display='';
+  tb.innerHTML = lines.map(l => `
+    <tr>
+      <td><input type="checkbox" class="linePick" value="${l.OrderItemID}"></td>
+      <td>${l.OrderItemID}</td>
+      <td>${l.OrderId}</td>
+      <td>${l.SKU || ''}</td>
+      <td>${l.Qualifier || ''}</td>
+      <td>${l.OrderedQTY}</td>
+    </tr>
+  `).join('');
+  $('allocBtn').disabled = false;
+}
+
+function renderInventory(inv){
+  const tb = $('invBody');
+  if (!inv?.length){
+    $('invTbl').style.display='none';
+    $('invHint').style.display='block';
+    return;
+  }
+  $('invHint').style.display='none';
+  $('invTbl').style.display='';
+  tb.innerHTML = inv.map(i => `
+    <tr>
+      <td>${i.ItemID || ''}</td>
+      <td>${i.Qualifier || ''}</td>
+      <td>${i.ReceiveItemID}</td>
+      <td>${i.AvailableQTY}</td>
+      <td>${i.ReceivedQty}</td>
+      <td>${i.LocationName || ''}</td>
+    </tr>
+  `).join('');
+}
+
+function renderSuggAlloc(rows){
+  const tb = $('saBody');
+  if (!rows?.length){
+    $('saTbl').style.display='none';
+    $('saHint').style.display='block';
+    return;
+  }
+  $('saHint').style.display='none';
+  $('saTbl').style.display='';
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td>${r.OrderItemID}</td>
+      <td>${r.ReceiveItemID}</td>
+      <td>${r.SuggAllocQty}</td>
+    </tr>
+  `).join('');
+}
+
+$('fetchBtn').addEventListener('click', async () => {
+  try {
+    const id = Number($('orderId').value);
+    if (!Number.isFinite(id) || id<=0) return alert('Enter a valid Order ID');
+    setStatus('Fetching order…');
+    const res = await fetch(`/api/single-alloc/order/${id}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'Order fetch failed');
+    currentOrderId = data.order.orderId;
+    currentLines   = data.lines || [];
+    renderLines(currentLines);
+    renderInventory(data.inventory || []);
+    renderSuggAlloc([]); // clear
+    setStatus(`Order #${currentOrderId} ready. Upserted ${data.upserts} line(s).`, 'ok');
+    $('pushBtn').disabled = false;
+  } catch (e) {
+    console.error(e);
+    setStatus(e.message || 'Failed to fetch order', 'err');
+  }
+});
+
+$('allocBtn').addEventListener('click', async () => {
+  try {
+    const selected = [...document.querySelectorAll('.linePick:checked')].map(cb => Number(cb.value));
+    if (!selected.length) return alert('Pick at least one line');
+    setStatus('Allocating…');
+    const res = await fetch('/api/single-alloc/allocate', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ lineIds: selected })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'Allocation failed');
+    renderSuggAlloc(data.rows || []);
+    setStatus(`Allocated ${data.rows?.length || 0} suggestions.`, 'ok');
+  } catch (e) {
+    console.error(e);
+    setStatus(e.message || 'Allocation failed', 'err');
+  }
+});
+
+$('pushBtn').addEventListener('click', async () => {
+  if (!currentOrderId) return alert('Fetch an order first.');
+  if (!confirm(`Push SuggAlloc for Order #${currentOrderId} to Extensiv?`)) return;
+  try {
+    setStatus('Pushing to Extensiv…');
+    const res = await fetch('/api/single-alloc/push', {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ orderId: currentOrderId })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(`Extensiv responded ${data.status}`);
+    setStatus(`Push OK (status ${data.status}).`, 'ok');
+  } catch (e) {
+    console.error(e);
+    setStatus(e.message || 'Push failed', 'err');
+  }
+});
+</script>
+</body>
+</html>
