@@ -2,10 +2,12 @@
 import { Router } from "express";
 import axios from "axios";
 import * as extMod from "../services/extensivClient.js";
-import { getPool } from "../services/db/mssql.js";
+import * as dbMod from "../services/db/mssql.js";
 
-/* --------------------------- module + router --------------------------- */
-const ext = extMod?.default ?? extMod; // works whether the service uses default or named exports
+// normalize imports (support named or default)
+const ext = extMod?.default ?? extMod;
+const db = dbMod?.default ?? dbMod;
+
 const r = Router();
 
 /* ------------------------------ helpers ------------------------------- */
@@ -13,20 +15,17 @@ const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const firstArray = (data) => {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.ResourceList)) return data.ResourceList;
+  if (Array.isArray(data?.data)) return data.data;
   if (Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])) {
     return data._embedded["http://api.3plCentral.com/rels/orders/order"];
   }
-  if (Array.isArray(data?.data)) return data.data;
   for (const v of Object.values(data || {})) if (Array.isArray(v)) return v;
   return [];
 };
 
-/* Build auth headers here in case the service module doesn’t export authHeaders() */
 async function authHeadersSafe() {
-  // If the service provides it, use that.
   if (typeof ext.authHeaders === "function") return await ext.authHeaders();
 
-  // Minimal local fallback
   const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
   if (b64) {
     return {
@@ -35,7 +34,6 @@ async function authHeadersSafe() {
       "Content-Type": "application/hal+json; charset=utf-8",
     };
   }
-
   const tokenUrl = process.env.EXT_TOKEN_URL;
   if (tokenUrl) {
     const form = new URLSearchParams();
@@ -62,8 +60,7 @@ async function authHeadersSafe() {
       };
     }
   }
-
-  throw new Error("No auth configured (missing EXT_BASIC_AUTH_B64 or OAuth token config).");
+  throw new Error("No auth configured (EXT_BASIC_AUTH_B64 or OAuth token).");
 }
 
 /* -------------------------------- DEBUG -------------------------------- */
@@ -81,18 +78,13 @@ r.get("/_debug", (_req, res) => {
       EXT_TPL_GUID: !!process.env.EXT_TPL_GUID,
       EXT_USER_LOGIN: !!process.env.EXT_USER_LOGIN,
       EXT_USER_LOGIN_ID: !!process.env.EXT_USER_LOGIN_ID,
-      EXT_CUSTOMER_IDS: !!process.env.EXT_CUSTOMER_IDS,
-      EXT_FACILITY_IDS: !!process.env.EXT_FACILITY_IDS,
       SQL_SERVER: !!process.env.SQL_SERVER,
       SQL_DATABASE: !!process.env.SQL_DATABASE,
       SQL_USER: !!process.env.SQL_USER,
       SQL_PASSWORD: !!process.env.SQL_PASSWORD,
     },
-    serviceExports: {
-      hasAuthHeaders: typeof ext.authHeaders === "function",
-      hasFetchAndUpsertOrders: typeof ext.fetchAndUpsertOrders === "function",
-      hasFetchOneOrderDetail: typeof ext.fetchOneOrderDetail === "function",
-    },
+    serviceExports: Object.keys(ext),
+    dbExports: Object.keys(db),
   });
 });
 
@@ -124,17 +116,6 @@ r.get("/peek", async (_req, res, next) => {
     res.json({
       ok: true,
       status: resp.status,
-      topLevelType: Array.isArray(data) ? "array" : "object",
-      keys: data && typeof data === "object" ? Object.keys(data) : [],
-      firstArrayKey: Array.isArray(data?.ResourceList)
-        ? "ResourceList"
-        : Array.isArray(data?.data)
-        ? "data"
-        : Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])
-        ? "_embedded/orders/order"
-        : Array.isArray(data)
-        ? "(root)"
-        : "none",
       firstArrayLen: list.length,
       sample: list[0] || data,
     });
@@ -153,7 +134,7 @@ r.get("/peekOrder", async (req, res, next) => {
       return res.json({ ok: true, orderId: id, payload });
     }
 
-    // Fallback if service didn’t export helper
+    // fallback if helper not present
     const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
     const headers = await authHeadersSafe();
     const { data } = await axios.get(`${base}/orders`, {
@@ -176,10 +157,8 @@ r.post("/import", async (req, res, next) => {
         .status(500)
         .json({ ok: false, message: "extensivClient.fetchAndUpsertOrders() is not available." });
     }
-    // Default to open/unallocated only unless caller overrides
     const body = req.body || {};
-    if (typeof body.openOnly === "undefined") body.openOnly = true;
-
+    if (typeof body.openOnly === "undefined") body.openOnly = true; // only open/unallocated by default
     const result = await ext.fetchAndUpsertOrders(body);
     res.json(result);
   } catch (e) {
@@ -199,25 +178,27 @@ r.get("/selftest", async (_req, res) => {
     const list = firstArray(o.data);
     out.steps.orders = { status: o.status, count: list.length };
 
+    const getPool = db?.getPool; // support named or default export
+    if (typeof getPool !== "function") throw new Error("DB getPool export missing.");
     const pool = await getPool();
     await pool.request().query("SELECT 1 as ok");
     out.steps.db = "connect-ok";
 
-    // Create a minimal OrderDetails table if it doesn’t exist (for connectivity)
+    // minimal table create for connectivity check
     await pool.request().batch(`
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
   CREATE TABLE dbo.OrderDetails (
-    OrderItemID   INT          NOT NULL PRIMARY KEY,
-    OrderID       INT          NULL,
-    CustomerName  VARCHAR(200) NULL,
-    CustomerID    INT          NULL,
-    ItemID        VARCHAR(150) NULL,
-    SKU           VARCHAR(150) NULL,
-    UnitID        INT          NULL,
-    UnitName      VARCHAR(80)  NULL,
-    Qualifier     VARCHAR(80)  NULL,
-    OrderedQTY    INT          NULL,
-    ReferenceNum  VARCHAR(120) NULL,
+    OrderItemID    INT          NOT NULL PRIMARY KEY,
+    OrderID        INT          NULL,
+    CustomerName   VARCHAR(200) NULL,
+    CustomerID     INT          NULL,
+    ItemID         VARCHAR(150) NULL,
+    SKU            VARCHAR(150) NULL,
+    UnitID         INT          NULL,
+    UnitName       VARCHAR(80)  NULL,
+    Qualifier      VARCHAR(80)  NULL,
+    OrderedQTY     INT          NULL,
+    ReferenceNum   VARCHAR(120) NULL,
     ShipToAddress1 VARCHAR(255) NULL
   );
     `);
