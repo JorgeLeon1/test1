@@ -1,5 +1,3 @@
-// index.js (ESM)
-
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -16,13 +14,14 @@ import axios from 'axios';
 import connectToDatabase from './connectTodb.js';
 import allocateOrders from './app/allocateOrder.js';
 
-// ✅ Correct router path; do NOT import services here
-import extensiv from './app/routes/extensiv.js';
 import allocRouter from "./app/routes/alloc.js";
 import extensivRouter from "./app/routes/extensiv.js";
 
+const app = express(); // 👈 moved up
+
 app.use("/extensiv", extensivRouter);
 app.use("/alloc", allocRouter);
+
 
 /* --------------------------- App bootstrap --------------------------- */
 
