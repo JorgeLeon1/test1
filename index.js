@@ -27,6 +27,26 @@ import singleAllocApi from "./app/routes/singleAllocApi.js";
 
 const app = express(); // ✅ create app first
 
+app.use(express.json());
+app.use(cors());
+app.use(express.urlencoded({ extended: true }));
+
+// Sessions are fine, but don't guard the API with page auth middleware
+app.use(session({
+  secret: 'your_secret_key',
+  resave: false,
+  saveUninitialized: true,
+  cookie: { secure: false, maxAge: 30 * 60 * 10000 },
+}));
+
+/* ------------------ MOUNT API ROUTERS FIRST ------------------ */
+app.use("/api/single-alloc", singleAllocApi);   // <- first
+app.use("/extensiv", extensivRouter);
+app.use("/alloc", allocRouter);
+
+/* ------------------ THEN STATIC + PAGE ROUTES ---------------- */
+app.use(express.static('public'));
+app.use("/", ordersRouter); // make sure this router does NOT have an "app.get('*')" catch-all
 // core middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
