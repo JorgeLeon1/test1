@@ -212,7 +212,7 @@ app.post('/allocateOrders', async (req, res) => {
 
 /* --------------------- Extensiv router (mount here) ------------------ */
 
-app.use('/extensiv', extensiv);
+app.use('/extensiv', extensivRouter);
 
 /* --------------------------- Health & errors ------------------------- */
 
