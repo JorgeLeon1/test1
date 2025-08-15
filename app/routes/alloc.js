@@ -311,7 +311,11 @@ r.post("/push", async (req, res) => {
     const headers = await (ext.authHeaders?.() ?? (async ()=> {
       // fallback to basic header if service not exporting (shouldn't happen)
       const b64 = process.env.EXT_BASIC_AUTH_B64 || "";
-      return { Authorization: b64 ? \`Basic \${b64}\` : "", Accept:"application/hal+json, application/json", "Content-Type":"application/hal+json; charset=utf-8" };
+      return {
+  Authorization: b64 ? `Basic ${b64}` : "",
+  Accept: "application/hal+json, application/json",
+  "Content-Type": "application/hal+json; charset=utf-8"
+};
     })());
     const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
 
