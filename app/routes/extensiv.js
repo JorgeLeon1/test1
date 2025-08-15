@@ -3,6 +3,67 @@ import { Router } from "express";
 import axios from "axios";
 import { authHeaders, fetchAndUpsertOrders, fetchOneOrderDetail } from "../services/extensivClient.js";
 import { getPool } from "../services/db/mssql.js";
+// --- SEARCH + LINES + RUN SQL ALLOC ---
+import { runSqlAllocation } from "../services/sqlAllocator.js";
+import { getPool } from "../services/db/mssql.js";
+
+// Search orders by a loose string (casts OrderId to varchar to allow partial)
+r.get("/orders/search", async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.json({ ok: true, results: [] });
+
+    const pool = await getPool();
+    const rs = await pool.request()
+      .input("q", sql.VarChar(50), `%${q}%`)
+      .query(`
+        SELECT TOP (50)
+          OrderId,
+          COUNT(*)        AS lineCount,
+          SUM(OrderedQTY) AS totalQty
+        FROM dbo.OrderDetails
+        WHERE CAST(OrderId AS VARCHAR(50)) LIKE @q
+        GROUP BY OrderId
+        ORDER BY OrderId DESC
+      `);
+
+    res.json({ ok: true, results: rs.recordset });
+  } catch (e) { next(e); }
+});
+
+// Get lines for a specific order
+r.get("/orders/:orderId/lines", async (req, res, next) => {
+  try {
+    const orderId = Number(req.params.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
+
+    const pool = await getPool();
+    const rs = await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`
+        SELECT OrderItemID,
+               COALESCE(NULLIF(LTRIM(RTRIM(SKU)), ''), NULLIF(LTRIM(RTRIM(ItemID)), '')) AS SKU,
+               Qualifier,
+               OrderedQTY
+        FROM dbo.OrderDetails
+        WHERE OrderId = @OrderId
+        ORDER BY OrderItemID
+      `);
+
+    res.json({ ok: true, orderId, lines: rs.recordset });
+  } catch (e) { next(e); }
+});
+
+// Run the SQL allocation (your script) for the order / selected lines
+r.post("/orders/:orderId/alloc/sql", async (req, res, next) => {
+  try {
+    const orderId = Number(req.params.orderId);
+    const selected = Array.isArray(req.body?.orderItemIds) ? req.body.orderItemIds : [];
+    const out = await runSqlAllocation(orderId, selected);
+    res.json(out);
+  } catch (e) { next(e); }
+});
+
 
 const r = Router();
 
@@ -139,6 +200,115 @@ IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
       data: e.response?.data,
     });
   }
+});
+r.get("/alloc-ui", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SQL Allocation Runner</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+    input[type="text"]{ padding:8px; width:280px; }
+    button{ padding:8px 12px; cursor:pointer; }
+    table{ border-collapse: collapse; margin-top:12px; width: 100%; }
+    th, td{ border:1px solid #ddd; padding:6px 8px; }
+    th{ background:#f6f6f6; text-align:left; }
+    .muted{ color:#666; font-size:12px; }
+    .row { display:flex; gap:8px; align-items:center; margin: 8px 0; }
+    .pill{ background:#eef; border-radius:9999px; padding:2px 8px; font-size:12px; }
+    .ok { color: #056; }
+    .err{ color:#b00; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h2>SQL Allocation Runner</h2>
+
+  <div class="row">
+    <input id="q" type="text" placeholder="Search Order #" />
+    <button onclick="search()">Search</button>
+    <span class="muted">Type full or partial order id</span>
+  </div>
+
+  <div id="orders"></div>
+  <div id="lines"></div>
+  <div id="run"></div>
+  <div id="result"></div>
+
+<script>
+let currentOrderId = null;
+let selected = new Set();
+
+async function search(){
+  const q = document.getElementById('q').value.trim();
+  document.getElementById('orders').innerHTML = 'Searching...';
+  const r = await fetch('/extensiv/orders/search?q=' + encodeURIComponent(q));
+  const j = await r.json();
+  if(!j.ok){ document.getElementById('orders').innerHTML = '<div class="err">Search failed</div>'; return; }
+  const rows = j.results || [];
+  if(!rows.length){ document.getElementById('orders').innerHTML = '<div>No matches</div>'; return; }
+  const html = ['<table><thead><tr><th>OrderId</th><th>Lines</th><th>Total Qty</th><th></th></tr></thead><tbody>'];
+  for(const row of rows){
+    html.push('<tr><td>'+row.OrderId+'</td><td>'+row.lineCount+'</td><td>'+row.totalQty+'</td>'+
+      '<td><button onclick="loadLines('+row.OrderId+')">Open</button></td></tr>');
+  }
+  html.push('</tbody></table>');
+  document.getElementById('orders').innerHTML = html.join('');
+  document.getElementById('lines').innerHTML = '';
+  document.getElementById('run').innerHTML = '';
+  document.getElementById('result').innerHTML = '';
+}
+
+async function loadLines(orderId){
+  currentOrderId = orderId;
+  selected = new Set();
+  document.getElementById('lines').innerHTML = 'Loading lines...';
+  const r = await fetch('/extensiv/orders/'+orderId+'/lines');
+  const j = await r.json();
+  if(!j.ok){ document.getElementById('lines').innerHTML = '<div class="err">Failed to load lines</div>'; return; }
+  const lines = j.lines || [];
+  const rows = ['<table><thead><tr><th>Select</th><th>OrderItemID</th><th>SKU</th><th>Qualifier</th><th>OrderedQTY</th></tr></thead><tbody>'];
+  for(const ln of lines){
+    rows.push('<tr>'+
+      '<td><input type="checkbox" onchange="toggleSel('+ln.OrderItemID+', this.checked)"/></td>'+
+      '<td>'+ln.OrderItemID+'</td>'+
+      '<td>'+ (ln.SKU || '') +'</td>'+
+      '<td>'+ (ln.Qualifier || '') +'</td>'+
+      '<td>'+ln.OrderedQTY+'</td>'+
+    '</tr>');
+  }
+  rows.push('</tbody></table>');
+  document.getElementById('lines').innerHTML = '<div class="pill">Order '+orderId+'</div>' + rows.join('');
+  document.getElementById('run').innerHTML = '<div class="row"><button onclick="runAlloc()">Run SQL Allocation</button><span class="muted">Runs into dbo.SuggAlloc</span></div>';
+  document.getElementById('result').innerHTML = '';
+}
+
+function toggleSel(id, on){ if(on) selected.add(id); else selected.delete(id); }
+
+async function runAlloc(){
+  if(!currentOrderId){ alert('Pick an order first'); return; }
+  const ids = Array.from(selected.values());
+  document.getElementById('result').innerHTML = 'Running allocation...';
+  const r = await fetch('/extensiv/orders/'+currentOrderId+'/alloc/sql', {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json' },
+    body: JSON.stringify({ orderItemIds: ids })
+  });
+  const j = await r.json();
+  if(!j.ok){ document.getElementById('result').innerHTML = '<div class="err">'+(j.message || 'Failed')+'</div>'; return; }
+  const rows = j.rows || [];
+  const html = ['<div class="ok">Done. '+rows.length+' suggestions.</div>',
+                '<table><thead><tr><th>OrderItemID</th><th>ReceiveItemID</th><th>SuggAllocQty</th></tr></thead><tbody>'];
+  for(const x of rows){
+    html.push('<tr><td>'+x.OrderItemID+'</td><td>'+x.ReceiveItemID+'</td><td>'+x.SuggAllocQty+'</td></tr>');
+  }
+  html.push('</tbody></table>');
+  document.getElementById('result').innerHTML = html.join('');
+}
+</script>
+</body>
+</html>`);
 });
 
 export default r;
