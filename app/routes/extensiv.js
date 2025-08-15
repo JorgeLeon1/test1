@@ -1,82 +1,32 @@
 // src/app/routes/extensiv.js
 import { Router } from "express";
 import axios from "axios";
-import { authHeaders, fetchAndUpsertOrders, fetchOneOrderDetail } from "../services/extensivClient.js";
-import { getPool } from "../services/db/mssql.js";
-// --- SEARCH + LINES + RUN SQL ALLOC ---
-import { runSqlAllocation } from "../services/sqlAllocator.js";
-import { getPool } from "../services/db/mssql.js";
 
-// Search orders by a loose string (casts OrderId to varchar to allow partial)
-r.get("/orders/search", async (req, res, next) => {
-  try {
-    const q = String(req.query.q || "").trim();
-    if (!q) return res.json({ ok: true, results: [] });
+import {
+  authHeaders,
+  fetchAndUpsertOrders,
+  fetchOneOrderDetail,
+} from "../services/extensivClient.js";
 
-    const pool = await getPool();
-    const rs = await pool.request()
-      .input("q", sql.VarChar(50), `%${q}%`)
-      .query(`
-        SELECT TOP (50)
-          OrderId,
-          COUNT(*)        AS lineCount,
-          SUM(OrderedQTY) AS totalQty
-        FROM dbo.OrderDetails
-        WHERE CAST(OrderId AS VARCHAR(50)) LIKE @q
-        GROUP BY OrderId
-        ORDER BY OrderId DESC
-      `);
+import { getPool, sql } from "../services/db/mssql.js";
 
-    res.json({ ok: true, results: rs.recordset });
-  } catch (e) { next(e); }
-});
-
-// Get lines for a specific order
-r.get("/orders/:orderId/lines", async (req, res, next) => {
-  try {
-    const orderId = Number(req.params.orderId);
-    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
-
-    const pool = await getPool();
-    const rs = await pool.request()
-      .input("OrderId", sql.Int, orderId)
-      .query(`
-        SELECT OrderItemID,
-               COALESCE(NULLIF(LTRIM(RTRIM(SKU)), ''), NULLIF(LTRIM(RTRIM(ItemID)), '')) AS SKU,
-               Qualifier,
-               OrderedQTY
-        FROM dbo.OrderDetails
-        WHERE OrderId = @OrderId
-        ORDER BY OrderItemID
-      `);
-
-    res.json({ ok: true, orderId, lines: rs.recordset });
-  } catch (e) { next(e); }
-});
-
-// Run the SQL allocation (your script) for the order / selected lines
-r.post("/orders/:orderId/alloc/sql", async (req, res, next) => {
-  try {
-    const orderId = Number(req.params.orderId);
-    const selected = Array.isArray(req.body?.orderItemIds) ? req.body.orderItemIds : [];
-    const out = await runSqlAllocation(orderId, selected);
-    res.json(out);
-  } catch (e) { next(e); }
-});
-
-
+/* --------------------------- init router FIRST --------------------------- */
 const r = Router();
 
+/* -------------------------------- helpers -------------------------------- */
 const trimBase = (u) => (u || "").replace(/\/+$/, "");
 const firstArray = (data) => {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.ResourceList)) return data.ResourceList;
   if (Array.isArray(data?.data)) return data.data;
-  if (Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"]))
+  if (Array.isArray(data?._embedded?.["http://api.3plCentral.com/rels/orders/order"])) {
     return data._embedded["http://api.3plCentral.com/rels/orders/order"];
+  }
   for (const v of Object.values(data || {})) if (Array.isArray(v)) return v;
   return [];
 };
+
+/* -------------------------------- DEBUG ---------------------------------- */
 
 r.get("/_debug", (_req, res) => {
   res.json({
@@ -111,6 +61,8 @@ r.get("/token", async (_req, res, next) => {
     next(e);
   }
 });
+
+/* --------------------------------- PEEK ---------------------------------- */
 
 r.get("/peek", async (_req, res, next) => {
   try {
@@ -153,6 +105,8 @@ r.get("/peekOrder", async (req, res, next) => {
   }
 });
 
+/* --------------------------- IMPORT (orders -> SQL) ---------------------- */
+
 r.post("/import", async (req, res, next) => {
   try {
     const result = await fetchAndUpsertOrders(req.body || {});
@@ -161,6 +115,8 @@ r.post("/import", async (req, res, next) => {
     next(e);
   }
 });
+
+/* ------------------------------- SELFTEST -------------------------------- */
 
 r.get("/selftest", async (_req, res) => {
   const out = { ok: false, steps: {} };
@@ -180,11 +136,31 @@ r.get("/selftest", async (_req, res) => {
     await pool.request().batch(`
 IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
   CREATE TABLE dbo.OrderDetails (
-    OrderItemID INT NULL,
+    OrderItemID INT NOT NULL PRIMARY KEY,
     OrderId     INT NULL,
-    ItemID      VARCHAR(100) NULL,
-    Qualifier   VARCHAR(50) NULL,
-    OrderedQTY  INT NULL
+    ItemID      VARCHAR(150) NULL, -- SKU
+    Qualifier   VARCHAR(80)  NULL,
+    OrderedQTY  INT          NULL
+  );
+
+IF OBJECT_ID('dbo.Inventory','U') IS NULL
+  CREATE TABLE dbo.Inventory (
+    ReceiveItemID INT NOT NULL PRIMARY KEY,
+    ItemID        VARCHAR(150) NOT NULL,  -- SKU
+    Qualifier     VARCHAR(80)  NULL,
+    ReceivedQty   INT          NULL,
+    AvailableQty  INT          NULL,
+    LocationName  VARCHAR(120) NULL
+  );
+
+IF OBJECT_ID('dbo.SuggAlloc','U') IS NULL
+  CREATE TABLE dbo.SuggAlloc (
+    Id            INT IDENTITY(1,1) PRIMARY KEY,
+    OrderId       INT NOT NULL,
+    OrderItemID   INT NOT NULL,
+    ReceiveItemID INT NOT NULL,
+    SuggAllocQty  INT NOT NULL,
+    CreatedAt     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
   );
     `);
 
@@ -201,114 +177,198 @@ IF OBJECT_ID('dbo.OrderDetails','U') IS NULL
     });
   }
 });
-r.get("/alloc-ui", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>SQL Allocation Runner</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    input[type="text"]{ padding:8px; width:280px; }
-    button{ padding:8px 12px; cursor:pointer; }
-    table{ border-collapse: collapse; margin-top:12px; width: 100%; }
-    th, td{ border:1px solid #ddd; padding:6px 8px; }
-    th{ background:#f6f6f6; text-align:left; }
-    .muted{ color:#666; font-size:12px; }
-    .row { display:flex; gap:8px; align-items:center; margin: 8px 0; }
-    .pill{ background:#eef; border-radius:9999px; padding:2px 8px; font-size:12px; }
-    .ok { color: #056; }
-    .err{ color:#b00; white-space: pre-wrap; }
-  </style>
-</head>
-<body>
-  <h2>SQL Allocation Runner</h2>
 
-  <div class="row">
-    <input id="q" type="text" placeholder="Search Order #" />
-    <button onclick="search()">Search</button>
-    <span class="muted">Type full or partial order id</span>
-  </div>
+/* ====================== SEARCH + SQL ALLOCATION TOOLS ===================== */
 
-  <div id="orders"></div>
-  <div id="lines"></div>
-  <div id="run"></div>
-  <div id="result"></div>
+/**
+ * Find rows for one OrderId in dbo.OrderDetails (for your search bar).
+ * GET /extensiv/search-order?orderId=205417
+ */
+r.get("/search-order", async (req, res, next) => {
+  try {
+    const orderId = Number(req.query.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Provide ?orderId=<number>" });
 
-<script>
-let currentOrderId = null;
-let selected = new Set();
+    const pool = await getPool();
+    const items = await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`
+SELECT OrderItemID, OrderId, ItemID AS SKU, Qualifier, OrderedQTY
+FROM dbo.OrderDetails
+WHERE OrderId = @OrderId
+ORDER BY OrderItemID;
+    `);
 
-async function search(){
-  const q = document.getElementById('q').value.trim();
-  document.getElementById('orders').innerHTML = 'Searching...';
-  const r = await fetch('/extensiv/orders/search?q=' + encodeURIComponent(q));
-  const j = await r.json();
-  if(!j.ok){ document.getElementById('orders').innerHTML = '<div class="err">Search failed</div>'; return; }
-  const rows = j.results || [];
-  if(!rows.length){ document.getElementById('orders').innerHTML = '<div>No matches</div>'; return; }
-  const html = ['<table><thead><tr><th>OrderId</th><th>Lines</th><th>Total Qty</th><th></th></tr></thead><tbody>'];
-  for(const row of rows){
-    html.push('<tr><td>'+row.OrderId+'</td><td>'+row.lineCount+'</td><td>'+row.totalQty+'</td>'+
-      '<td><button onclick="loadLines('+row.OrderId+')">Open</button></td></tr>');
+    const summary = await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`
+SELECT COUNT(*) AS lineCount, SUM(OrderedQTY) AS totalQty
+FROM dbo.OrderDetails WHERE OrderId = @OrderId;
+    `);
+
+    res.json({
+      ok: true,
+      orderId,
+      lines: items.recordset,
+      summary: summary.recordset?.[0] || { lineCount: 0, totalQty: 0 },
+    });
+  } catch (e) {
+    next(e);
   }
-  html.push('</tbody></table>');
-  document.getElementById('orders').innerHTML = html.join('');
-  document.getElementById('lines').innerHTML = '';
-  document.getElementById('run').innerHTML = '';
-  document.getElementById('result').innerHTML = '';
-}
-
-async function loadLines(orderId){
-  currentOrderId = orderId;
-  selected = new Set();
-  document.getElementById('lines').innerHTML = 'Loading lines...';
-  const r = await fetch('/extensiv/orders/'+orderId+'/lines');
-  const j = await r.json();
-  if(!j.ok){ document.getElementById('lines').innerHTML = '<div class="err">Failed to load lines</div>'; return; }
-  const lines = j.lines || [];
-  const rows = ['<table><thead><tr><th>Select</th><th>OrderItemID</th><th>SKU</th><th>Qualifier</th><th>OrderedQTY</th></tr></thead><tbody>'];
-  for(const ln of lines){
-    rows.push('<tr>'+
-      '<td><input type="checkbox" onchange="toggleSel('+ln.OrderItemID+', this.checked)"/></td>'+
-      '<td>'+ln.OrderItemID+'</td>'+
-      '<td>'+ (ln.SKU || '') +'</td>'+
-      '<td>'+ (ln.Qualifier || '') +'</td>'+
-      '<td>'+ln.OrderedQTY+'</td>'+
-    '</tr>');
-  }
-  rows.push('</tbody></table>');
-  document.getElementById('lines').innerHTML = '<div class="pill">Order '+orderId+'</div>' + rows.join('');
-  document.getElementById('run').innerHTML = '<div class="row"><button onclick="runAlloc()">Run SQL Allocation</button><span class="muted">Runs into dbo.SuggAlloc</span></div>';
-  document.getElementById('result').innerHTML = '';
-}
-
-function toggleSel(id, on){ if(on) selected.add(id); else selected.delete(id); }
-
-async function runAlloc(){
-  if(!currentOrderId){ alert('Pick an order first'); return; }
-  const ids = Array.from(selected.values());
-  document.getElementById('result').innerHTML = 'Running allocation...';
-  const r = await fetch('/extensiv/orders/'+currentOrderId+'/alloc/sql', {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json' },
-    body: JSON.stringify({ orderItemIds: ids })
-  });
-  const j = await r.json();
-  if(!j.ok){ document.getElementById('result').innerHTML = '<div class="err">'+(j.message || 'Failed')+'</div>'; return; }
-  const rows = j.rows || [];
-  const html = ['<div class="ok">Done. '+rows.length+' suggestions.</div>',
-                '<table><thead><tr><th>OrderItemID</th><th>ReceiveItemID</th><th>SuggAllocQty</th></tr></thead><tbody>'];
-  for(const x of rows){
-    html.push('<tr><td>'+x.OrderItemID+'</td><td>'+x.ReceiveItemID+'</td><td>'+x.SuggAllocQty+'</td></tr>');
-  }
-  html.push('</tbody></table>');
-  document.getElementById('result').innerHTML = html.join('');
-}
-</script>
-</body>
-</html>`);
 });
 
+/**
+ * Run your SuggAlloc loop for a single order.
+ * POST /extensiv/allocate-sql  { "orderId": 205417 }
+ */
+r.post("/allocate-sql", async (req, res, next) => {
+  try {
+    const orderId = Number(req.body?.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Body must include { orderId:number }" });
+
+    const pool = await getPool();
+
+    // Ensure table exists
+    await pool.request().batch(`
+IF OBJECT_ID('dbo.SuggAlloc','U') IS NULL
+  CREATE TABLE dbo.SuggAlloc (
+    Id            INT IDENTITY(1,1) PRIMARY KEY,
+    OrderId       INT NOT NULL,
+    OrderItemID   INT NOT NULL,
+    ReceiveItemID INT NOT NULL,
+    SuggAllocQty  INT NOT NULL,
+    CreatedAt     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+    `);
+
+    // Clear previous suggestions for this order (optional; comment out if you want to append)
+    await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`DELETE FROM dbo.SuggAlloc WHERE OrderId = @OrderId;`);
+
+    // Batch that follows your sequence logic, but scoped to a single order id.
+    const allocationBatch = `
+DECLARE @OrderId INT = @pOrderId;
+
+WHILE EXISTS (
+  SELECT 1
+  FROM dbo.OrderDetails a
+  LEFT JOIN (
+    SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
+    FROM dbo.SuggAlloc WHERE OrderId = @OrderId
+    GROUP BY OrderItemID
+  ) c ON a.OrderItemID = c.OrderItemID
+  WHERE a.OrderId = @OrderId
+    AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) > 0
+)
+BEGIN
+  INSERT INTO dbo.SuggAlloc (OrderId, OrderItemID, ReceiveItemID, SuggAllocQty)
+  SELECT TOP 1
+    @OrderId AS OrderId,
+    a.OrderItemID,
+    b.ReceiveItemID,
+    CASE WHEN (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQTY
+         THEN b.AvailableQTY ELSE (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) END AS AllocQty
+  FROM dbo.OrderDetails a
+  LEFT JOIN (
+    SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
+    FROM dbo.SuggAlloc WHERE OrderId = @OrderId
+    GROUP BY OrderItemID
+  ) c ON a.OrderItemID = c.OrderItemID
+  INNER JOIN dbo.Inventory b
+    ON a.ItemID = b.ItemID
+    AND ISNULL(a.Qualifier,'') = ISNULL(b.Qualifier,'')
+  WHERE a.OrderId = @OrderId
+    AND b.ReceiveItemId NOT IN (SELECT ReceiveItemID FROM dbo.SuggAlloc WHERE OrderId = @OrderId)
+    AND b.AvailableQTY > 0
+    AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) > 0
+  ORDER BY
+    a.OrderItemID,
+    -- Your Seq logic
+    CASE
+      WHEN b.ReceivedQty = b.AvailableQty AND SUBSTRING(b.LocationName,4,1) = 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) = b.AvailableQty THEN 1
+      WHEN b.ReceivedQty = b.AvailableQty AND SUBSTRING(b.LocationName,4,1) <> 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) = b.AvailableQty THEN 2
+      WHEN b.ReceivedQty = b.AvailableQty AND SUBSTRING(b.LocationName,4,1) <> 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) > b.AvailableQty  THEN 3
+      WHEN b.ReceivedQty = b.AvailableQty AND SUBSTRING(b.LocationName,4,1) = 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) > b.AvailableQty  THEN 4
+      WHEN b.ReceivedQty > b.AvailableQty AND SUBSTRING(b.LocationName,4,1) = 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQty THEN 5
+      WHEN b.ReceivedQty > b.AvailableQty AND SUBSTRING(b.LocationName,4,1) <> 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQty THEN 6
+      WHEN SUBSTRING(b.LocationName,4,1) = 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) <= b.AvailableQty THEN 7
+      WHEN SUBSTRING(b.LocationName,4,1) <> 'A'
+           AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) <= b.AvailableQty THEN 8
+      ELSE 999
+    END ASC,
+    -- Secondary sort like your comment: prefer bigger available for seq 1-6; otherwise smaller
+    CASE
+      WHEN b.ReceivedQty = b.AvailableQty THEN b.AvailableQty
+      ELSE (999999 - b.AvailableQty)
+    END DESC;
+END;
+    `;
+
+    await pool.request()
+      .input("pOrderId", sql.Int, orderId)
+      .batch(allocationBatch);
+
+    // Return suggestions for this order
+    const rows = await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`
+SELECT sa.OrderItemID, sa.ReceiveItemID, sa.SuggAllocQty,
+       inv.LocationName, inv.AvailableQty AS AvailableAtTime
+FROM dbo.SuggAlloc sa
+LEFT JOIN dbo.Inventory inv ON sa.ReceiveItemID = inv.ReceiveItemID
+WHERE sa.OrderId = @OrderId
+ORDER BY sa.OrderItemID, sa.Id;
+      `);
+
+    res.json({ ok: true, orderId, suggestions: rows.recordset });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
+ * Export the suggestions in Extensiv payload shape (for /orders/{id}/allocator).
+ * GET /extensiv/allocations/payload?orderId=205417
+ */
+r.get("/allocations/payload", async (req, res, next) => {
+  try {
+    const orderId = Number(req.query.orderId);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Provide ?orderId=<number>" });
+
+    const pool = await getPool();
+    const rs = await pool.request()
+      .input("OrderId", sql.Int, orderId)
+      .query(`
+SELECT OrderItemID, ReceiveItemID, SuggAllocQty
+FROM dbo.SuggAlloc
+WHERE OrderId = @OrderId
+ORDER BY OrderItemID, Id;
+      `);
+
+    // Group by orderItemId into the payload expected by Extensiv
+    const byItem = new Map();
+    for (const r of rs.recordset) {
+      if (!byItem.has(r.OrderItemID)) byItem.set(r.OrderItemID, []);
+      byItem.get(r.OrderItemID).push({ receiveItemId: r.ReceiveItemID, qty: r.SuggAllocQty });
+    }
+    const proposedAllocations = Array.from(byItem.entries()).map(([orderItemId, allocations]) => ({
+      orderItemId,
+      proposedAllocations: allocations,
+    }));
+
+    res.json({ ok: true, orderId, proposedAllocations });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* -------------------------------- EXPORT --------------------------------- */
 export default r;
