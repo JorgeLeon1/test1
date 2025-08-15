@@ -107,9 +107,20 @@ r.get("/peekOrder", async (req, res, next) => {
 
 /* --------------------------- IMPORT (orders -> SQL) ---------------------- */
 
+// full control body: { maxPages?, pageSize?, unallocatedOnly?, statusOpenOnly? }
 r.post("/import", async (req, res, next) => {
   try {
     const result = await fetchAndUpsertOrders(req.body || {});
+    res.json(result);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// convenience: import ONLY unallocated, open
+r.post("/import-unallocated", async (_req, res, next) => {
+  try {
+    const result = await fetchAndUpsertOrders({ unallocatedOnly: true, statusOpenOnly: true, pageSize: 200, maxPages: 20 });
     res.json(result);
   } catch (e) {
     next(e);
@@ -180,10 +191,7 @@ IF OBJECT_ID('dbo.SuggAlloc','U') IS NULL
 
 /* ====================== SEARCH + SQL ALLOCATION TOOLS ===================== */
 
-/**
- * Find rows for one OrderId in dbo.OrderDetails (for your search bar).
- * GET /extensiv/search-order?orderId=205417
- */
+// GET /extensiv/search-order?orderId=205417
 r.get("/search-order", async (req, res, next) => {
   try {
     const orderId = Number(req.query.orderId);
@@ -217,10 +225,7 @@ FROM dbo.OrderDetails WHERE OrderId = @OrderId;
   }
 });
 
-/**
- * Run your SuggAlloc loop for a single order.
- * POST /extensiv/allocate-sql  { "orderId": 205417 }
- */
+// POST /extensiv/allocate-sql  { "orderId": 205417 }
 r.post("/allocate-sql", async (req, res, next) => {
   try {
     const orderId = Number(req.body?.orderId);
@@ -228,7 +233,6 @@ r.post("/allocate-sql", async (req, res, next) => {
 
     const pool = await getPool();
 
-    // Ensure table exists
     await pool.request().batch(`
 IF OBJECT_ID('dbo.SuggAlloc','U') IS NULL
   CREATE TABLE dbo.SuggAlloc (
@@ -241,12 +245,10 @@ IF OBJECT_ID('dbo.SuggAlloc','U') IS NULL
   );
     `);
 
-    // Clear previous suggestions for this order (optional; comment out if you want to append)
     await pool.request()
       .input("OrderId", sql.Int, orderId)
       .query(`DELETE FROM dbo.SuggAlloc WHERE OrderId = @OrderId;`);
 
-    // Batch that follows your sequence logic, but scoped to a single order id.
     const allocationBatch = `
 DECLARE @OrderId INT = @pOrderId;
 
@@ -284,7 +286,6 @@ BEGIN
     AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) > 0
   ORDER BY
     a.OrderItemID,
-    -- Your Seq logic
     CASE
       WHEN b.ReceivedQty = b.AvailableQty AND SUBSTRING(b.LocationName,4,1) = 'A'
            AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) = b.AvailableQty THEN 1
@@ -304,7 +305,6 @@ BEGIN
            AND (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) <= b.AvailableQty THEN 8
       ELSE 999
     END ASC,
-    -- Secondary sort like your comment: prefer bigger available for seq 1-6; otherwise smaller
     CASE
       WHEN b.ReceivedQty = b.AvailableQty THEN b.AvailableQty
       ELSE (999999 - b.AvailableQty)
@@ -316,7 +316,6 @@ END;
       .input("pOrderId", sql.Int, orderId)
       .batch(allocationBatch);
 
-    // Return suggestions for this order
     const rows = await pool.request()
       .input("OrderId", sql.Int, orderId)
       .query(`
@@ -334,10 +333,7 @@ ORDER BY sa.OrderItemID, sa.Id;
   }
 });
 
-/**
- * Export the suggestions in Extensiv payload shape (for /orders/{id}/allocator).
- * GET /extensiv/allocations/payload?orderId=205417
- */
+// GET /extensiv/allocations/payload?orderId=205417
 r.get("/allocations/payload", async (req, res, next) => {
   try {
     const orderId = Number(req.query.orderId);
@@ -353,7 +349,6 @@ WHERE OrderId = @OrderId
 ORDER BY OrderItemID, Id;
       `);
 
-    // Group by orderItemId into the payload expected by Extensiv
     const byItem = new Map();
     for (const r of rs.recordset) {
       if (!byItem.has(r.OrderItemID)) byItem.set(r.OrderItemID, []);
@@ -368,6 +363,122 @@ ORDER BY OrderItemID, Id;
   } catch (e) {
     next(e);
   }
+});
+
+/* ------------------------------ MINI UI PAGE ----------------------------- */
+/** GET /extensiv/ui — super simple UI to search an order and run allocation */
+r.get("/ui", (_req, res) => {
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Extensiv Allocations</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:20px;}
+  input,button{font-size:16px;padding:8px}
+  button{cursor:pointer}
+  .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  table{border-collapse:collapse; width:100%; margin-top:12px}
+  td,th{border:1px solid #ddd; padding:6px 8px; text-align:left}
+  th{background:#f5f5f5}
+  pre{white-space:pre-wrap; background:#f7f7f7; padding:10px; border:1px solid #eee}
+  .muted{color:#666}
+</style>
+</head>
+<body>
+  <h2>Extensiv: Unallocated Orders & Allocation Runner</h2>
+
+  <div class="row" style="margin-bottom:12px">
+    <button id="btnImport">Import Unallocated/Open Orders → SQL</button>
+    <span id="importStatus" class="muted"></span>
+  </div>
+
+  <div class="row">
+    <label for="orderId">Order #</label>
+    <input id="orderId" type="number" placeholder="205417" />
+    <button id="btnSearch">Search Lines</button>
+    <button id="btnAlloc">Run SQL Allocation</button>
+    <button id="btnPayload">View Extensiv Payload</button>
+  </div>
+
+  <div id="summary" class="muted" style="margin-top:10px"></div>
+  <div id="results"></div>
+  <h3>Suggestions</h3>
+  <div id="suggs" class="muted">No suggestions yet.</div>
+
+  <h3>Extensiv payload</h3>
+  <pre id="payload" class="muted">Click "View Extensiv Payload" after running allocation.</pre>
+
+<script>
+  const qs = (s) => document.querySelector(s);
+  const orderInput = qs('#orderId');
+  const results = qs('#results');
+  const summary = qs('#summary');
+  const suggs = qs('#suggs');
+  const payload = qs('#payload');
+  const importStatus = qs('#importStatus');
+
+  async function callJSON(url, opts={}) {
+    const resp = await fetch(url, { headers: { "Content-Type":"application/json" }, ...opts });
+    const text = await resp.text();
+    try { return { status: resp.status, json: JSON.parse(text) }; }
+    catch { return { status: resp.status, text } }
+  }
+
+  async function doImport() {
+    importStatus.textContent = 'Importing…';
+    const r = await callJSON('./import-unallocated', { method: 'POST' });
+    importStatus.textContent = r.json ? JSON.stringify(r.json) : (r.text || r.status);
+  }
+
+  async function search() {
+    const id = Number(orderInput.value);
+    if (!id) { alert('Enter an Order #'); return; }
+    results.innerHTML = 'Loading…';
+    summary.textContent = '';
+    const r = await callJSON('./search-order?orderId=' + id);
+    if (!r.json || !r.json.ok) {
+      results.textContent = 'No data';
+      return;
+    }
+    const lines = r.json.lines || [];
+    summary.textContent = 'Lines: ' + (r.json.summary?.lineCount || 0) + ', Total Qty: ' + (r.json.summary?.totalQty || 0);
+    if (!lines.length) { results.textContent = 'No lines found for that order.'; return; }
+    const rows = lines.map(x => '<tr><td>'+x.OrderItemID+'</td><td>'+x.SKU+'</td><td>'+ (x.Qualifier||'') +'</td><td>'+x.OrderedQTY+'</td></tr>').join('');
+    results.innerHTML = '<table><thead><tr><th>OrderItemID</th><th>SKU</th><th>Qualifier</th><th>OrderedQTY</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }
+
+  async function runAlloc() {
+    const id = Number(orderInput.value);
+    if (!id) { alert('Enter an Order #'); return; }
+    suggs.textContent = 'Allocating…';
+    const r = await callJSON('./allocate-sql', { method:'POST', body: JSON.stringify({ orderId: id }) });
+    if (!r.json || !r.json.ok) { suggs.textContent = 'Allocation failed'; return; }
+    if (!r.json.suggestions?.length) { suggs.textContent = 'No suggestions'; return; }
+    const rows = r.json.suggestions.map(s =>
+      '<tr><td>'+s.OrderItemID+'</td><td>'+s.ReceiveItemID+'</td><td>'+s.SuggAllocQty+
+      '</td><td>'+(s.LocationName||'')+'</td><td>'+(s.AvailableAtTime ?? '')+'</td></tr>'
+    ).join('');
+    suggs.innerHTML = '<table><thead><tr><th>OrderItemID</th><th>ReceiveItemID</th><th>Qty</th><th>Location</th><th>Avail (at plan time)</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }
+
+  async function viewPayload() {
+    const id = Number(orderInput.value);
+    if (!id) { alert('Enter an Order #'); return; }
+    payload.textContent = 'Loading…';
+    const r = await callJSON('./allocations/payload?orderId=' + id);
+    if (!r.json || !r.json.ok) { payload.textContent = 'Failed'; return; }
+    payload.textContent = JSON.stringify({ proposedAllocations: r.json.proposedAllocations }, null, 2);
+  }
+
+  qs('#btnImport').addEventListener('click', doImport);
+  qs('#btnSearch').addEventListener('click', search);
+  qs('#btnAlloc').addEventListener('click', runAlloc);
+  qs('#btnPayload').addEventListener('click', viewPayload);
+</script>
+</body></html>`;
+  res.type("html").send(html);
 });
 
 /* -------------------------------- EXPORT --------------------------------- */
