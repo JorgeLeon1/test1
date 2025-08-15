@@ -319,7 +319,7 @@ r.post("/push", async (req, res) => {
     })());
     const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
 
-    const resp = await axios.put(\`\${base}/orders/\${orderId}/allocator\`, payload, {
+    const resp = await axios.put(`${base}/orders/${orderId}/allocator`, payload, {
       headers, timeout: 30000, validateStatus: () => true
     });
 
