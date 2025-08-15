@@ -2,273 +2,284 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Allocate Orders</title>
+  <title>Allocate Order (Single)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root{--brand:#10b981;--brand2:#3b82f6;--muted:#6b7280;--bg:#f5f7fb;--card:#fff;--line:#e5e7eb}
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
-    header{padding:18px 22px} h1{margin:0;font-size:22px;color:#0f766e}
-    .bar{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
-    button{border:0;border-radius:8px;padding:10px 14px;font-weight:600;color:#fff;cursor:pointer}
-    .pri{background:var(--brand)} .sec{background:var(--brand2)} .ghost{background:#4b5563}
-    .wrap{display:grid;grid-template-columns:1fr 1.2fr;gap:18px;padding:0 22px 22px}
-    .card{background:var(--card);border-radius:12px;box-shadow:0 6px 24px rgba(16,24,40,.04);overflow:hidden;border:1px solid var(--line)}
-    .card h3{margin:0;padding:14px 16px;border-bottom:1px solid var(--line);font-size:16px}
-    .pad{padding:12px}
-    .row{display:flex;gap:10px;align-items:center}
-    input[type="search"]{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px}
+    :root{
+      --bg:#f7f8fa;--card:#fff;--muted:#6b7280;--text:#111827;
+      --accent:#10b981;--accent-2:#3b82f6;--danger:#ef4444;--border:#e5e7eb;
+    }
+    *{box-sizing:border-box} body{margin:0;padding:24px;background:var(--bg);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto}
+    h1{margin:0 0 16px} .row{display:flex;gap:16px;flex-wrap:wrap}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.06)}
+    .toolbar{display:flex;gap:10px;align-items:center}
+    input[type=text]{padding:.65rem .8rem;border:1px solid var(--border);border-radius:8px;min-width:260px}
+    button{padding:.6rem 1rem;border:0;border-radius:8px;cursor:pointer;color:#fff;background:var(--accent)}
+    button.secondary{background:var(--accent-2)} button.ghost{background:#9ca3af}
+    button.warn{background:var(--danger)} button:disabled{opacity:.5;cursor:not-allowed}
+    .panel{padding:16px}
     table{width:100%;border-collapse:collapse}
-    th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}
-    tbody tr:hover{background:#f0fdf4}
-    .orders{max-height:62vh;overflow:auto}
-    .lines{max-height:62vh;overflow:auto}
-    .muted{color:#6b7280} .right{display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:10px 12px}
-    .pill{padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
-    .empty{padding:16px;color:#6b7280}
-    .spinner{width:24px;height:24px;border-radius:50%;border:4px solid #e5e7eb;border-top-color:#60a5fa;animation:spin 1s linear infinite}
+    th,td{padding:.55rem .8rem;border-bottom:1px solid var(--border);text-align:left}
+    thead th{background:#f3f4f6;font-weight:600}
+    .muted{color:var(--muted)} .right{display:flex;justify-content:flex-end;align-items:center;gap:10px}
+    #linesCard{flex:1 1 800px} #orderCard{flex:1 1 380px;max-width:420px}
+    .pill{display:inline-block;padding:.1rem .5rem;border-radius:999px;background:#eef2ff;color:#3730a3;font-weight:600;font-size:.82rem}
+    #log{white-space:pre-wrap;background:#0b1020;color:#cde3ff;border-radius:10px;padding:10px;max-height:180px;overflow:auto;border:1px solid #0f1630}
+    .spinner{width:20px;height:20px;border:3px solid #d1d5db;border-top-color:#111827;border-radius:50%;animation:spin 1s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .hidden{display:none}
   </style>
 </head>
 <body>
 
-<header>
-  <h1>Allocate Orders</h1>
-  <div class="bar">
-    <button class="sec"  id="btnImport">Import from Extensiv</button>
-    <button class="pri"  id="btnSqlAllocAll">Run SQL Allocation (all)</button>
-    <button class="ghost" id="btnPush">Push to Extensiv</button>
+  <h1>Allocate Order</h1>
+
+  <!-- Controls -->
+  <div class="card panel" style="margin-bottom:16px;">
+    <div class="toolbar">
+      <input id="orderIdInput" type="text" placeholder="Enter Order ID (e.g. 123456)" />
+      <button class="secondary" id="loadBtn">Load Order</button>
+      <button class="ghost" id="clearBtn">Clear</button>
+      <span id="status" class="muted"></span>
+    </div>
   </div>
-</header>
 
-<main class="wrap">
-  <!-- Orders -->
-  <section class="card">
-    <h3>Orders</h3>
-    <div class="pad row">
-      <input id="search" type="search" placeholder="Search by Order ID, Customer, or SKU…"/>
-      <button class="sec" id="btnRefresh">Refresh</button>
+  <div class="row">
+    <!-- Order header -->
+    <div id="orderCard" class="card panel">
+      <h3 style="margin-top:0;">Order</h3>
+      <div id="orderMeta" class="muted">No order loaded.</div>
     </div>
-    <div class="orders" id="ordersBox">
-      <div class="empty" id="ordersEmpty">No orders found.</div>
-      <table id="ordersTable" class="hidden">
-        <thead>
-          <tr><th>Order</th><th>Customer</th><th class="muted">Open Lines</th></tr>
-        </thead>
-        <tbody id="ordersTbody"></tbody>
-      </table>
-    </div>
-  </section>
 
-  <!-- Lines -->
-  <section class="card">
-    <h3>Lines</h3>
-    <div class="lines">
+    <!-- Lines -->
+    <div id="linesCard" class="card panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h3 style="margin:0;">Lines</h3>
+        <div class="right">
+          <span id="selectedCount" class="muted">0 selected</span>
+          <button id="allocBtn" disabled>Allocate in SQL</button>
+          <button id="pushBtn" class="secondary" disabled>Push to Extensiv</button>
+        </div>
+      </div>
+
       <table>
         <thead>
-          <tr><th style="width:40px"><input type="checkbox" id="chkAll"/></th><th>SKU</th><th>Qty</th><th>Qualifier</th></tr>
+          <tr>
+            <th style="width:36px;"><input type="checkbox" id="selectAll"></th>
+            <th>SKU</th>
+            <th>Qty</th>
+            <th>Qualifier</th>
+            <th>Unit</th>
+          </tr>
         </thead>
-        <tbody id="linesTbody">
-          <tr><td colspan="4" class="empty">Select an order to view lines.</td></tr>
+        <tbody id="linesBody">
+          <tr><td colspan="5" class="muted">Load an order to see its lines.</td></tr>
         </tbody>
       </table>
     </div>
-    <div class="right">
-      <span class="muted"><span id="selCount">0</span> selected</span>
-      <button class="pri" id="btnAllocate">Allocate Selected Order</button>
-    </div>
-  </section>
-</main>
+  </div>
 
-<!-- Toast / small output area -->
-<div id="toast" class="hidden" style="position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;"></div>
+  <!-- log -->
+  <div class="card panel" style="margin-top:16px;">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <strong>Activity</strong><div id="busy" style="display:none" class="spinner"></div>
+    </div>
+    <div id="log"></div>
+  </div>
 
 <script>
-/* ------------------ helpers ------------------ */
-const $ = (sel) => document.querySelector(sel);
-const show = (el, on=true)=> el.classList.toggle('hidden', !on);
-let ORDERS = [];        // [{orderId, customerName, lines:[{orderItemId, sku, qty, qualifier}]}]
-let FILTERED = [];      // filtered view
-let currentOrderId = null;
+  // ----- state -----
+  let currentOrderId = null;
+  let lines = []; // {orderItemId, sku, qty, qualifier, unitName, unitId}
+  const SEL = () => Array.from(document.querySelectorAll('.rowchk:checked')).map(c => Number(c.value));
 
-function toast(msg, ms=2200){
-  const t = $('#toast'); t.textContent = msg; show(t,true);
-  setTimeout(()=>show(t,false), ms);
-}
+  // ----- el helpers -----
+  const el = id => document.getElementById(id);
+  const status = (t='') => el('status').textContent = t;
+  const log = (msg, obj) => {
+    const time = new Date().toLocaleTimeString();
+    el('log').textContent += `[${time}] ${msg}` + (obj ? `\n${JSON.stringify(obj,null,2)}` : '') + '\n';
+    el('log').scrollTop = el('log').scrollHeight;
+  };
+  const busy = b => el('busy').style.display = b ? 'inline-block' : 'none';
 
-async function jget(url){
-  const r = await fetch(url); if(!r.ok) throw new Error(await r.text()); return r.json();
-}
-async function jpost(url, body){
-  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  if(!r.ok) throw new Error(await r.text()); return r.json();
-}
+  // ----- rendering -----
+  function renderOrderMeta(order) {
+    if (!order) {
+      el('orderMeta').textContent = 'No order loaded.';
+      return;
+    }
+    const cust = order.customerName || '(unknown)';
+    const ref  = order.referenceNum || '';
+    const addr = order.shipTo?.address1 || '';
+    el('orderMeta').innerHTML = `
+      <div><strong>#${order.orderId}</strong> <span class="pill">${cust}</span></div>
+      <div class="muted" style="margin-top:6px">
+        Ref: ${ref || '-'}<br>
+        ShipTo: ${addr || '-'}
+      </div>
+    `;
+  }
 
-/* ------------- data loaders ------------- */
-async function loadOrders(){
-  // Try nested endpoint first
-  try{
-    const data = await jget('/extensiv/orders-with-lines');
-    if(Array.isArray(data) && data.length){ ORDERS = data; FILTERED = data; renderOrders(); return; }
-  }catch(e){ console.warn('orders-with-lines:', e.message); }
+  function renderLines() {
+    const tb = el('linesBody');
+    if (!lines.length) {
+      tb.innerHTML = `<tr><td colspan="5" class="muted">No lines.</td></tr>`;
+      el('allocBtn').disabled = true;
+      el('pushBtn').disabled  = true;
+      el('selectAll').checked = false;
+      el('selectedCount').textContent = '0 selected';
+      return;
+    }
+    tb.innerHTML = lines.map(li => `
+      <tr>
+        <td><input class="rowchk" type="checkbox" value="${li.orderItemId}"></td>
+        <td>${li.sku || '-'}</td>
+        <td>${li.qty ?? 0}</td>
+        <td>${li.qualifier || ''}</td>
+        <td>${li.unitName || ''}</td>
+      </tr>
+    `).join('');
+    el('allocBtn').disabled = false;
+    el('pushBtn').disabled  = false;
+    el('selectAll').checked = false;
+    updateSelectedCount();
 
-  // Fallback: flat list -> group in browser
-  try{
-    const flat = await jget('/api/unallocated-orders');
-    if(Array.isArray(flat) && flat.length){
-      const by = new Map();
-      for(const r of flat){
-        if(!by.has(r.OrderID)) by.set(r.OrderID,{orderId:r.OrderID,customerName:r.CustomerName||'',lines:[]});
-        by.get(r.OrderID).lines.push({orderItemId:r.OrderItemID,sku:r.SKU,qty:r.OrderedQTY,qualifier:r.Qualifier||''});
+    document.querySelectorAll('.rowchk').forEach(cb => {
+      cb.addEventListener('change', updateSelectedCount);
+    });
+  }
+
+  function updateSelectedCount() {
+    el('selectedCount').textContent = `${SEL().length} selected`;
+  }
+
+  // ----- actions -----
+  async function loadOrder() {
+    const raw = el('orderIdInput').value.trim();
+    const id  = Number(raw);
+    if (!id) { alert('Enter a numeric Order ID'); return; }
+
+    try {
+      busy(true); status('Loading order…');
+      const r = await fetch(`/api/single-alloc/order/${id}`);
+      const data = await r.json();
+
+      if (!data.ok) {
+        log('Load failed', data);
+        alert(data.message || 'Failed to load order');
+        status('Load failed');
+        return;
       }
-      ORDERS = Array.from(by.values()); FILTERED = ORDERS; renderOrders(); return;
+
+      currentOrderId = data.order?.orderId || id;
+      renderOrderMeta(data.order);
+
+      // normalize rows for table
+      lines = (data.lines || []).map(x => ({
+        orderItemId: x.OrderItemID ?? x.orderItemId ?? x.id,
+        sku:         x.SKU ?? x.ItemID ?? x.sku,
+        qty:         x.OrderedQTY ?? x.qty ?? 0,
+        qualifier:   x.Qualifier ?? x.qualifier ?? '',
+        unitId:      x.UnitID ?? x.unitId ?? null,
+        unitName:    x.UnitName ?? x.unitName ?? ''
+      }));
+      renderLines();
+
+      log(`Order ${currentOrderId} loaded with ${lines.length} lines.`, { order: data.order });
+      status('Order ready');
+    } catch (e) {
+      console.error(e);
+      log('Load error', { error: e.message });
+      alert('Error loading order');
+      status('Error');
+    } finally {
+      busy(false);
     }
-  }catch(e){ console.warn('unallocated-orders:', e.message); }
-
-  // Last fallback (legacy)
-  try{
-    const legacy = await jget('/getAllOrders');
-    const by = new Map();
-    for(const r of legacy||[]){
-      if(!by.has(r.order_id)) by.set(r.order_id,{orderId:r.order_id,customerName:r.customerName||'',lines:[]});
-      by.get(r.order_id).lines.push({orderItemId:r.id,sku:r.sku,qty:r.qty,qualifier:r.qualifier||''});
-    }
-    ORDERS = Array.from(by.values()); FILTERED = ORDERS; renderOrders(); return;
-  }catch(e){ console.warn('getAllOrders:', e.message); }
-
-  ORDERS = []; FILTERED = []; renderOrders();
-}
-
-/* ------------- renderers ------------- */
-function renderOrders(){
-  const tbody = $('#ordersTbody');
-  tbody.innerHTML = '';
-  if(!FILTERED.length){
-    show($('#ordersTable'), false);
-    $('#ordersEmpty').textContent = 'No orders found.';
-    show($('#ordersEmpty'), true);
-    renderLines(null);
-    return;
   }
-  show($('#ordersEmpty'), false);
-  show($('#ordersTable'), true);
 
-  for(const o of FILTERED){
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><strong>#${o.orderId}</strong></td>
-      <td>${o.customerName||''}</td>
-      <td><span class="pill">${o.lines.length}</span></td>`;
-    tr.style.cursor='pointer';
-    tr.addEventListener('click', ()=> selectOrder(o.orderId));
-    tbody.appendChild(tr);
+  async function allocateSelected() {
+    if (!currentOrderId) return alert('Load an order first');
+    const ids = SEL();
+    if (!ids.length) return alert('Select at least one line to allocate');
+
+    try {
+      busy(true); status('Allocating in SQL…');
+      const r = await fetch('/api/single-alloc/allocate', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify({ orderId: currentOrderId, lineIds: ids })
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        log('Allocation failed', data);
+        alert(data.message || 'Allocation failed');
+        status('Allocation failed');
+        return;
+      }
+      log('Allocation complete', data);
+      status('Allocated');
+      alert('Allocation complete (saved in SuggAlloc).');
+    } catch (e) {
+      console.error(e);
+      log('Allocation error', { error: e.message });
+      alert('Allocation error');
+      status('Error');
+    } finally { busy(false); }
   }
-  // keep current selection visible if exists
-  if(currentOrderId){ selectOrder(currentOrderId, true); }
-}
 
-function selectOrder(orderId, silent=false){
-  currentOrderId = orderId;
-  const order = ORDERS.find(o=>o.orderId===orderId) || FILTERED.find(o=>o.orderId===orderId);
-  renderLines(order);
-  if(!silent) toast(`Order #${orderId} selected`);
-}
+  async function pushToExtensiv() {
+    if (!currentOrderId) return alert('Load an order first');
+    if (!confirm(`Push allocations for order #${currentOrderId} to Extensiv?`)) return;
 
-function renderLines(order){
-  const tb = $('#linesTbody'); tb.innerHTML = '';
-  $('#chkAll').checked = false; $('#selCount').textContent = '0';
-
-  if(!order){
-    tb.innerHTML = `<tr><td colspan="4" class="empty">Select an order to view lines.</td></tr>`;
-    return;
+    try {
+      busy(true); status('Pushing to Extensiv…');
+      const r = await fetch('/api/single-alloc/push', {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify({ orderId: currentOrderId })
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        log('Push failed', data);
+        alert(data.message || 'Push failed');
+        status('Push failed');
+        return;
+      }
+      log('Push complete', data);
+      status('Pushed');
+      alert('Pushed to Extensiv successfully.');
+    } catch (e) {
+      console.error(e);
+      log('Push error', { error: e.message });
+      alert('Push error');
+      status('Error');
+    } finally { busy(false); }
   }
-  for(const ln of order.lines){
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><input type="checkbox" class="lineChk" data-id="${ln.orderItemId}"/></td>
-      <td>${ln.sku}</td>
-      <td>${ln.qty}</td>
-      <td>${ln.qualifier||''}</td>`;
-    tb.appendChild(tr);
+
+  function clearAll() {
+    currentOrderId = null;
+    lines = [];
+    el('orderIdInput').value = '';
+    renderOrderMeta(null);
+    renderLines();
+    status('');
+    log('Cleared.');
   }
-}
 
-/* ------------- interactions ------------- */
-$('#chkAll').addEventListener('change', (e)=>{
-  document.querySelectorAll('.lineChk').forEach(c=> c.checked = e.target.checked);
-  updateSelCount();
-});
-document.addEventListener('change', (e)=>{
-  if(e.target.classList.contains('lineChk')) updateSelCount();
-});
-function updateSelCount(){
-  const n = [...document.querySelectorAll('.lineChk:checked')].length;
-  $('#selCount').textContent = String(n);
-}
+  // ----- events -----
+  el('loadBtn').addEventListener('click', loadOrder);
+  el('orderIdInput').addEventListener('keydown', e => { if (e.key === 'Enter') loadOrder(); });
+  el('allocBtn').addEventListener('click', allocateSelected);
+  el('pushBtn').addEventListener('click', pushToExtensiv);
+  el('clearBtn').addEventListener('click', clearAll);
+  el('selectAll').addEventListener('change', e => {
+    document.querySelectorAll('.rowchk').forEach(cb => cb.checked = e.target.checked);
+    updateSelectedCount();
+  });
 
-$('#btnAllocate').addEventListener('click', async ()=>{
-  const ids = [...document.querySelectorAll('.lineChk:checked')].map(c=>Number(c.dataset.id));
-  if(!currentOrderId){ return alert('Select an order first.'); }
-  if(!ids.length){ return alert('Select at least one line.'); }
-  try{
-    await jpost('/allocateOrders', { lineIds: ids });
-    toast('Allocation complete');
-    // refresh the data to reflect reduced open qty
-    await loadOrders();
-    // reselect the same order if still present
-    if(ORDERS.some(o=>o.orderId===currentOrderId)) selectOrder(currentOrderId);
-    else renderLines(null);
-  }catch(e){
-    console.error(e); alert('Allocation failed: ' + e.message);
-  }
-});
-
-$('#btnImport').addEventListener('click', async ()=>{
-  try{
-    const r = await jpost('/extensiv/import', { status:'AWAITINGPICK' });
-    toast(`Import complete: ${r.upsertedItems ?? 0} lines`);
-    await loadOrders();
-  }catch(e){ console.error(e); alert('Import failed: ' + e.message); }
-});
-
-$('#btnSqlAllocAll').addEventListener('click', async ()=>{
-  try{
-    const r = await jpost('/extensiv/allocate', {});
-    toast('SQL allocation finished');
-    await loadOrders();
-  }catch(e){ console.error(e); alert('SQL allocation failed: ' + e.message); }
-});
-
-$('#btnPush').addEventListener('click', async ()=>{
-  if(!confirm('Push current SuggAlloc to Extensiv?')) return;
-  try{
-    const r = await jpost('/extensiv/push', {});
-    toast('Push complete');
-  }catch(e){ console.error(e); alert('Push failed: ' + e.message); }
-});
-
-$('#btnRefresh').addEventListener('click', loadOrders);
-
-$('#search').addEventListener('input', (e)=>{
-  const q = e.target.value.trim().toLowerCase();
-  if(!q){ FILTERED = ORDERS; renderOrders(); return; }
-  FILTERED = ORDERS
-    .map(o => ({
-      ...o,
-      lines: o.lines.filter(l =>
-        (l.sku||'').toLowerCase().includes(q) ||
-        String(o.orderId).includes(q) ||
-        (o.customerName||'').toLowerCase().includes(q)
-      )
-    }))
-    .filter(o => String(o.orderId).includes(q) ||
-                 (o.customerName||'').toLowerCase().includes(q) ||
-                 o.lines.length);
-  renderOrders();
-});
-
-/* ------------- boot ------------- */
-loadOrders();
+  // page starts blank — no auto-load
+  renderOrderMeta(null);
+  renderLines();
 </script>
 </body>
 </html>
