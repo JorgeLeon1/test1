@@ -2,13 +2,22 @@
 import { Router } from "express";
 import axios from "axios";
 
-import {
-  authHeaders,
-  fetchAndUpsertOrders,
-  fetchOneOrderDetail,
-} from "../services/extensivClient.js";
+import * as ext from "../services/extensivClient.js";
 
 import { getPool, sql } from "../services/db/mssql.js";
+
+// token route
+const h = await ext.authHeaders();
+
+// import route
+const result = await ext.fetchAndUpsertOrders(req.body || {});
+
+// peekOrder route
+const payload = await ext.fetchOneOrderDetail(id);
+
+// selftest
+const headers = await ext.authHeaders();
+
 
 /* --------------------------- init router FIRST --------------------------- */
 const r = Router();
