@@ -23,9 +23,6 @@ app.use("/extensiv", extensivRouter); // ✅ Mount routers after declaration
 app.use("/alloc", allocRouter);
 
 
-/* --------------------------- App bootstrap --------------------------- */
-
-const app = express();
 
 app.use(express.json());
 app.use(cors());
