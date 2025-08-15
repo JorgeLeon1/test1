@@ -17,9 +17,9 @@ import allocateOrders from './app/allocateOrder.js';
 import allocRouter from "./app/routes/alloc.js";
 import extensivRouter from "./app/routes/extensiv.js";
 
-const app = express(); // 👈 moved up
+const app = express(); // ✅ Declare first
 
-app.use("/extensiv", extensivRouter);
+app.use("/extensiv", extensivRouter); // ✅ Mount routers after declaration
 app.use("/alloc", allocRouter);
 
 
