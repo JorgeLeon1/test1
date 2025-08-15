@@ -17,13 +17,15 @@ import allocateOrders from './app/allocateOrder.js';
 import allocRouter from "./app/routes/alloc.js";
 import extensivRouter from "./app/routes/extensiv.js";
 
+import ordersRouter from "./app/routes/orders.js";
+
 const app = express(); // ✅ Declare first
 
 app.use("/extensiv", extensivRouter); // ✅ Mount routers after declaration
 app.use("/alloc", allocRouter);
 
 
-
+app.use("/", ordersRouter);
 app.use(express.json());
 app.use(cors());
 app.use(express.urlencoded({ extended: true }));
