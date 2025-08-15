@@ -2,261 +2,417 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Order Lines</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Allocate Orders</title>
   <style>
-    body { font-family: sans-serif; background:#f9fafb; margin:2rem; }
-    h2  { margin-bottom:1rem; font-size:1.8rem; color:#00796b; font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-    .toolbar { display:flex; gap:.5rem; margin:.75rem 0 1.25rem; flex-wrap:wrap; }
-    button { background:#10b981; color:#fff; padding:.6rem 1rem; border:none; border-radius:6px; font-size:1rem; cursor:pointer; transition:background-color .2s ease; }
-    button.secondary { background:#3b82f6; }
-    button.warn { background:#6b7280; }
-    button:hover { filter:brightness(0.95); }
-    table { width:100%; border-collapse:collapse; margin-bottom:2rem; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,.05); }
-    thead { background:#e5e7eb; }
-    th, td { padding:.45rem 1rem; border-bottom:1px solid #e5e7eb; text-align:left; font-size:11pt; }
-    tr.group-header { background:#f3f4f6; font-weight:bold; }
-    tr:hover td { background:#f0fdf4; }
-    input[type="checkbox"] { transform:scale(1.2); }
-    .loading { font-style:italic; color:#6b7280; }
-    .spinner { border:8px solid #5c6bc0; border-top:8px solid #3498db; border-radius:50%; width:60px; height:60px; animation:spin 1s linear infinite; }
-    #loadingSpinner { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); z-index:1000; display:none; }
-    #out { white-space:pre-wrap; background:#fff; border:1px solid #e5e7eb; padding:.75rem; border-radius:6px; margin:.75rem 0; font-size:.95rem; color:#111827; }
-    @keyframes spin { 0%{transform:rotate(0)} 100%{transform:rotate(360deg)} }
+    :root { --green:#10b981; --blue:#3b82f6; --gray:#6b7280; --bg:#f9fafb; --card:#fff; --line:#e5e7eb; }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; margin:20px; background:var(--bg); color:#111827;}
+    h2{margin:0 0 12px; color:#065f46}
+    .toolbar{display:flex;gap:.5rem;flex-wrap:wrap;margin:10px 0 16px}
+    button{background:var(--green);color:#fff;border:0;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}
+    button.secondary{background:var(--blue)}
+    button.warn{background:var(--gray)}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .row{display:flex;gap:18px;align-items:flex-start}
+    .left,.right{flex:1 1 0}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.04)}
+    .card h3{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:16px}
+    .card .body{padding:12px 14px}
+    .search{display:flex;gap:8px}
+    .search input{flex:1 1 0;padding:10px 12px;border:1px solid var(--line);border-radius:8px}
+    .orders{max-height:60vh;overflow:auto}
+    .order{border-bottom:1px solid var(--line)}
+    .order-header{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;cursor:pointer}
+    .order-header:hover{background:#f3f4f6}
+    .meta{font-size:12px;color:#4b5563}
+    .pill{background:#ecfeff;color:#0369a1;border:1px solid #bae6fd;padding:2px 8px;border-radius:999px;font-size:12px}
+    .lines{display:none}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-top:1px solid var(--line);padding:8px 10px;text-align:left}
+    th{background:#f8fafc;font-size:12px;color:#374151}
+    .right .body{padding:0}
+    .footer{display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:12px;border-top:1px solid var(--line)}
+    .muted{font-size:12px;color:#6b7280}
+    #out{white-space:pre-wrap;background:#fff;border:1px solid var(--line);padding:10px;border-radius:8px;margin-top:12px;display:none}
+    .spinner{display:none;position:fixed;inset:0;backdrop-filter:blur(1px);align-items:center;justify-content:center;z-index:50}
+    .spinner > div{width:54px;height:54px;border:6px solid #d1d5db;border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
   </style>
 </head>
 <body>
 
-  <h2>Select Order Lines To Allocate</h2>
+  <h2>Allocate Orders</h2>
 
   <div class="toolbar">
-    <!-- NEW: Extensiv workflow buttons -->
-    <button class="secondary" onclick="importFromExtensiv()">Import from Extensiv</button>
-    <button onclick="runSqlAllocation()">Run SQL Allocation</button>
-    <button class="warn" onclick="pushToExtensiv()">Push to Extensiv</button>
-
-    <!-- Your existing flow -->
-    <button onclick="allocateOrderLines()">Allocate Selected Lines (legacy)</button>
-    <button class="secondary" id="toggle-orders-btn" onclick="toggleOrdersContainer()" style="display:none;">Show Orders</button>
-    <button class="warn" onclick="alert('coming soon! Choose batch by PO, destination, etc.')">Define a batch</button>
-    <button class="warn" onclick="alert('coming soon! Consolidate partial pallets')">Consolidate</button>
+    <button class="secondary" id="btnImport">Import from Extensiv</button>
+    <button id="btnRunSql">Run SQL Allocation (all)</button>
+    <button class="warn" id="btnPush">Push to Extensiv</button>
   </div>
 
-  <div id="out" style="display:none;"></div>
+  <div class="row">
+    <!-- LEFT: Orders & search -->
+    <div class="left card">
+      <h3>Orders</h3>
+      <div class="body">
+        <div class="search">
+          <input id="q" placeholder="Search by Order ID, Customer, or SKU…"/>
+          <button class="secondary" id="btnRefresh">Refresh</button>
+        </div>
 
-  <div id="orders-container">
-    <p class="loading">Loading orders...</p>
+        <div class="orders" id="orders"></div>
+        <div class="muted" id="emptyMsg" style="display:none;padding:8px 0;">No orders found.</div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Lines for chosen order -->
+    <div class="right card">
+      <h3 id="panelTitle">Lines</h3>
+      <div class="body">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:42px;">
+                <input type="checkbox" id="chkAll" disabled />
+              </th>
+              <th>SKU</th>
+              <th>Qty</th>
+              <th>Qualifier</th>
+            </tr>
+          </thead>
+          <tbody id="linesTbody">
+            <tr><td colspan="4" class="muted" style="padding:14px;">Select an order to view lines.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="footer">
+        <span class="muted" id="selectionHint">0 selected</span>
+        <button id="btnAllocate" disabled>Allocate Selected Order</button>
+      </div>
+    </div>
   </div>
 
-  <div id="visualization-container" style="margin-top: 2rem;"></div>
+  <div id="out"></div>
+  <div class="spinner" id="spinner"><div></div></div>
 
-  <div id="loadingSpinner"><div class="spinner"></div></div>
+<script>
+/* ----------------------- state ----------------------- */
+let RAW = [];            // flat rows from API/DB
+let ORDERS = [];         // normalized [{orderId, customerName, lines:[...] }]
+let FILTERED = [];       // filtered orders for UI
+let selectedOrderId = null;
 
-  <script>
-    // ---------- Helpers ----------
-    const spinnerEl = document.getElementById('loadingSpinner');
-    const outEl = document.getElementById('out');
-    function showSpinner(show=true){ spinnerEl.style.display = show ? 'block' : 'none'; }
-    function showOut(obj, title){
-      outEl.style.display = 'block';
-      outEl.textContent = (title ? title + "\n" : "") + JSON.stringify(obj, null, 2);
+/* ----------------------- helpers --------------------- */
+const $ = (sel, ctx=document) => ctx.querySelector(sel);
+const $$ = (sel, ctx=document) => Array.from(ctx.querySelectorAll(sel));
+const show = (el, on=true) => el.style.display = on ? '' : 'none';
+const spin = (on=true) => show($('#spinner'), on);
+const out = (obj, title) => { const el=$('#out'); el.textContent=(title?title+"\n":"")+JSON.stringify(obj,null,2); show(el,true); };
+
+function normalizeRows(rows) {
+  // Accepts different shapes/keys and yields nested orders w/lines
+  const byOrder = new Map();
+  for (const r of rows || []) {
+    const OrderID      = r.OrderID ?? r.orderId ?? r.order_id ?? r.OrderId ?? r.orderid;
+    const OrderItemID  = r.OrderItemID ?? r.orderItemId ?? r.order_item_id ?? r.id;
+    const CustomerName = r.CustomerName ?? r.customerName ?? r.customer;
+    const SKU          = r.SKU ?? r.sku ?? r.ItemID ?? r.itemId;
+    const Qty          = r.OrderedQTY ?? r.qty ?? r.quantity ?? r.orderedQty;
+    const Qualifier    = r.Qualifier ?? r.qualifier ?? '';
+
+    if (!OrderID || !OrderItemID) continue;
+
+    if (!byOrder.has(OrderID)) {
+      byOrder.set(OrderID, { orderId: OrderID, customerName: CustomerName || '(Unknown Customer)', lines: [] });
     }
-    const api = (path, method='POST', body=null) =>
-      fetch(path, {
-        method,
-        headers: { 'Content-Type':'application/json' },
-        body: body ? JSON.stringify(body) : null
-      }).then(r => r.json());
+    byOrder.get(OrderID).lines.push({
+      orderItemId: Number(OrderItemID),
+      sku: String(SKU || ''),
+      qty: Number(Qty || 0),
+      qualifier: String(Qualifier || '')
+    });
+  }
+  return Array.from(byOrder.values()).sort((a,b)=>String(a.orderId).localeCompare(String(b.orderId)));
+}
 
-    // ---------- NEW: Extensiv workflow ----------
-    async function importFromExtensiv() {
-      try {
-        showSpinner(true);
-        const data = await api('/extensiv/import', 'POST', {
-          modifiedSince: '2025-07-01T00:00:00Z',
-          status: 'AWAITINGPICK'
-        });
-        showOut(data, 'Import result:');
-        alert('Import complete. Check console/output box.');
-        console.log('[import]', data);
-      } catch (e) {
-        console.error(e); alert('Import failed');
-      } finally { showSpinner(false); }
-    }
+function renderOrders(list) {
+  const wrap = $('#orders');
+  wrap.innerHTML = '';
+  if (!list.length) { show($('#emptyMsg'), true); return; }
+  show($('#emptyMsg'), false);
 
-    async function runSqlAllocation() {
-      try {
-        showSpinner(true);
-        const data = await api('/extensiv/allocate', 'POST');
-        showOut(data, 'SQL allocation result:');
-        alert('Allocation complete. Check console/output box.');
-        console.log('[allocate]', data);
-      } catch (e) {
-        console.error(e); alert('Allocation failed');
-      } finally { showSpinner(false); }
-    }
+  for (const o of list) {
+    const id = `order-${o.orderId}`;
+    const el = document.createElement('div');
+    el.className = 'order';
 
-    async function pushToExtensiv() {
-      if (!confirm('Push SuggAlloc to Extensiv?')) return;
-      try {
-        showSpinner(true);
-        const data = await api('/extensiv/push', 'POST');
-        showOut(data, 'Push result:');
-        alert('Push complete. Check console/output box.');
-        console.log('[push]', data);
-      } catch (e) {
-        console.error(e); alert('Push failed');
-      } finally { showSpinner(false); }
-    }
+    el.innerHTML = `
+      <div class="order-header" data-id="${o.orderId}">
+        <div>
+          <label>
+            <input type="radio" name="orderPick" value="${o.orderId}" ${o.orderId==selectedOrderId?'checked':''}/>
+            <strong>#${o.orderId}</strong>
+          </label>
+          <div class="meta">${o.customerName || ''}</div>
+        </div>
+        <div><span class="pill">${o.lines.length} line(s)</span></div>
+      </div>
+      <div class="lines" id="${id}">
+        <table>
+          <thead>
+            <tr><th></th><th>SKU</th><th>Qty</th><th>Qualifier</th></tr>
+          </thead>
+          <tbody>
+            ${o.lines.map(line => `
+              <tr>
+                <td><input type="checkbox" class="lineChk" data-oi="${line.orderItemId}" ${o.orderId==selectedOrderId?'':'disabled'}></td>
+                <td>${line.sku}</td>
+                <td>${line.qty}</td>
+                <td>${line.qualifier || ''}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
 
-    // ---------- Your existing grouping/table ----------
-    function groupByOrder(data) {
-      return data.reduce((acc, line) => {
-        const key = `${line.order_id} | ${line.customerName}`;
-        (acc[key] ||= []).push(line);
-        return acc;
-      }, {});
-    }
+    // expand if selected
+    const linesBox = el.querySelector('.lines');
+    linesBox.style.display = (o.orderId == selectedOrderId) ? '' : 'none';
 
-    function renderTable(groupedData) {
-      const container = document.getElementById('orders-container');
-      container.innerHTML = '';
-      for (const groupKey in groupedData) {
-        const [orderNumber, customer] = groupKey.split(' | ');
-        const lines = groupedData[groupKey];
-        const groupId = `group-${orderNumber}`;
-
-        const tableWrapper = document.createElement('div');
-        tableWrapper.classList.add('table-wrapper');
-        tableWrapper.dataset.group = groupId;
-
-        const table = document.createElement('table');
-        const thead = document.createElement('thead');
-        thead.innerHTML = `
-          <tr class="group-header">
-            <td colspan="5">
-              <label>
-                <input type="checkbox" class="toggle-group" data-group="${groupId}" checked />
-                <strong>Order #${orderNumber} – ${customer}</strong>
-              </label>
-              &nbsp;&nbsp;&nbsp;
-              <label style="font-weight: normal; font-size: .9em;">
-                <input type="checkbox" class="select-all-group" data-group="${groupId}" />
-                Select All
-              </label>
-            </td>
-          </tr>
-          <tr>
-            <th style="padding:4px;"></th>
-            <th style="padding:4px;">SKU</th>
-            <th style="padding:4px;">Quantity</th>
-          </tr>
-        `;
-
-        const tbody = document.createElement('tbody');
-        tbody.classList.add('group-lines');
-        tbody.dataset.group = groupId;
-
-        for (const line of lines) {
-          const row = document.createElement('tr');
-          row.innerHTML = `
-            <td style="padding:4px;"><input type="checkbox" class="select-line" data-id="${line.order_id}" data-group="${groupId}" /></td>
-            <td style="padding:4px;">${line.sku}</td>
-            <td style="padding:4px;">${line.qty}</td>
-          `;
-          tbody.appendChild(row);
-        }
-
-        table.appendChild(thead);
-        table.appendChild(tbody);
-        tableWrapper.appendChild(table);
-        container.appendChild(tableWrapper);
+    // header click toggles + selects
+    el.querySelector('.order-header').addEventListener('click', (evt) => {
+      const clickedOrderId = el.querySelector('input[type="radio"]').value;
+      if (selectedOrderId == clickedOrderId) {
+        // just toggle expand/collapse
+        linesBox.style.display = (linesBox.style.display === 'none') ? '' : 'none';
+      } else {
+        selectedOrderId = clickedOrderId;
+        // re-render to enable checkboxes appropriately
+        renderOrders(FILTERED);
+        renderSelectedPanel();
       }
+    });
 
-      // Collapse/expand groups
-      document.querySelectorAll('.toggle-group').forEach(cb => {
-        cb.addEventListener('change', (e) => {
-          const group = e.target.dataset.group;
-          const rows = document.querySelectorAll(`tbody[data-group="${group}"]`);
-          rows.forEach(row => row.style.display = e.target.checked ? '' : 'none');
-        });
-      });
+    wrap.appendChild(el);
+  }
+}
 
-      // Select all in group
-      document.querySelectorAll('.select-all-group').forEach(cb => {
-        cb.addEventListener('change', (e) => {
-          const group = e.target.dataset.group;
-          document.querySelectorAll(`.select-line[data-group="${group}"]`)
-            .forEach(c => c.checked = e.target.checked);
-        });
-      });
-    }
+function renderSelectedPanel() {
+  const order = ORDERS.find(o => String(o.orderId) === String(selectedOrderId));
+  $('#panelTitle').textContent = order ? `Lines for Order #${order.orderId}` : 'Lines';
+  const chkAll = $('#chkAll');
+  const tbody  = $('#linesTbody');
 
-    function toggleOrdersContainer() {
-      const ordersContainer = document.getElementById('orders-container');
-      const toggleBtn = document.getElementById('toggle-orders-btn');
-      const hidden = ordersContainer.style.display === 'none';
-      ordersContainer.style.display = hidden ? 'block' : 'none';
-      toggleBtn.textContent = hidden ? 'Hide Orders' : 'Show Orders';
-    }
+  if (!order) {
+    chkAll.checked = false; chkAll.disabled = true;
+    tbody.innerHTML = `<tr><td colspan="4" class="muted" style="padding:14px;">Select an order to view lines.</td></tr>`;
+    $('#btnAllocate').disabled = true;
+    $('#selectionHint').textContent = '0 selected';
+    return;
+  }
 
-    // ---------- Your legacy allocation button ----------
-    async function allocateOrderLines() {
-      const selected = Array.from(document.querySelectorAll('.select-line:checked'));
-      const selectedIds = selected.map(cb => cb.dataset.id);
-      if (!selectedIds.length) return alert('Please select at least one order line to allocate.');
+  chkAll.disabled = false;
+  chkAll.checked = true;
 
-      // Hide list, show toggle
-      document.getElementById('orders-container').style.display = 'none';
-      document.getElementById('toggle-orders-btn').style.display = 'inline-block';
+  // mark all visible checkboxes for this order as checked by default
+  const section = document.querySelector(`#order-${order.orderId}`);
+  if (section) {
+    $$('.lineChk', section).forEach(cb => { cb.checked = true; });
+  }
 
+  // Mirror selected section into the right table for clarity
+  tbody.innerHTML = order.lines.map(line => `
+    <tr>
+      <td><input type="checkbox" class="mirrorChk" data-oi="${line.orderItemId}" checked></td>
+      <td>${line.sku}</td>
+      <td>${line.qty}</td>
+      <td>${line.qualifier || ''}</td>
+    </tr>
+  `).join('');
+
+  // keep left/right checkboxes in sync
+  tbody.querySelectorAll('.mirrorChk').forEach(mcb => {
+    mcb.addEventListener('change', () => {
+      const left = document.querySelector(`.lineChk[data-oi="${mcb.dataset.oi}"]`);
+      if (left) left.checked = mcb.checked;
+      updateSelectionHint();
+    });
+  });
+
+  chkAll.addEventListener('change', () => {
+    const on = chkAll.checked;
+    tbody.querySelectorAll('.mirrorChk').forEach(c => c.checked = on);
+    const leftSection = document.querySelector(`#order-${order.orderId}`);
+    if (leftSection) leftSection.querySelectorAll('.lineChk').forEach(c => c.checked = on);
+    updateSelectionHint();
+  });
+
+  $('#btnAllocate').disabled = false;
+  updateSelectionHint();
+}
+
+function currentSelectedLineIds() {
+  if (!selectedOrderId) return [];
+  return $$('.mirrorChk')
+    .filter(cb => cb.checked)
+    .map(cb => Number(cb.dataset.oi));
+}
+
+function updateSelectionHint() {
+  $('#selectionHint').textContent = `${currentSelectedLineIds().length} selected`;
+}
+
+/* ----------------------- data loading ------------------ */
+async function tryJson(url, options) {
+  const r = await fetch(url, options);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
+}
+
+async function loadData() {
+  spin(true);
+  try {
+    let rows = [];
+    // 1) unallocated rows straight from DB
+    try {
+      rows = await tryJson('/api/unallocated-orders');
+    } catch {}
+    // 2) nested endpoint (if present)
+    if (!rows?.length) {
       try {
-        showSpinner(true);
-        const res = await fetch('/allocateOrders', {
-          method: 'POST',
-          headers: { 'Content-Type':'application/json' },
-          body: JSON.stringify({ lineIds: selectedIds })
-        });
-        showSpinner(false);
-        if (!res.ok) throw new Error('Server error');
-        const data = await res.json();
-        alert('Allocations (legacy):\n' + JSON.stringify(data));
-        loadVisualization();
-      } catch (err) {
-        console.error(err); alert('Failed to allocate order lines.');
-      } finally { showSpinner(false); }
+        const nested = await tryJson('/extensiv/orders-with-lines');
+        // flatten if nested came back
+        if (Array.isArray(nested)) {
+          for (const o of nested) {
+            for (const l of (o.lines||[])) {
+              rows.push({
+                OrderID:o.orderId, CustomerName:o.customerName,
+                OrderItemID:l.orderItemId, SKU:l.sku, OrderedQTY:l.qty, Qualifier:l.qualifier
+              });
+            }
+          }
+        }
+      } catch {}
+    }
+    // 3) your older endpoint
+    if (!rows?.length) {
+      try {
+        const flat = await tryJson('/getAllOrders');
+        rows = Array.isArray(flat) ? flat : [];
+      } catch {}
     }
 
-    function loadVisualization() {
-      fetch('visualizeLocations.html')
-        .then(res => res.text())
-        .then(html => {
-          document.getElementById('visualization-container').innerHTML = html;
-          const scripts = document.getElementById('visualization-container').querySelectorAll("script");
-          scripts.forEach(oldScript => {
-            const s = document.createElement("script");
-            if (oldScript.src) s.src = oldScript.src; else s.textContent = oldScript.textContent;
-            document.body.appendChild(s);
-          });
-        })
-        .catch(err => {
-          console.error('Failed to load visualization:', err);
-          alert('Could not load allocation visualization.');
-        });
+    RAW = rows || [];
+    ORDERS = normalizeRows(RAW);
+    FILTERED = ORDERS.slice();
+    renderOrders(FILTERED);
+    // pick first order by default
+    if (ORDERS.length && !selectedOrderId) {
+      selectedOrderId = ORDERS[0].orderId;
+      renderOrders(FILTERED);
     }
+    renderSelectedPanel();
+  } catch (e) {
+    console.error(e);
+    $('#orders').innerHTML = '<div class="muted" style="padding:10px;">Failed to load orders.</div>';
+  } finally {
+    spin(false);
+  }
+}
 
-    // ---------- Init ----------
-    fetch('/getAllOrders')
-      .then(r => r.json())
-      .then(data => {
-        alert('Note: TEST orders. Allocations will not be posted to Extensiv during tests.');
-        const grouped = groupByOrder(data);
-        renderTable(grouped);
-      })
-      .catch(err => {
-        document.getElementById('orders-container').innerHTML = '<p>Error loading orders.</p>';
-        console.error(err);
-      });
-  </script>
+/* -------------------- actions / buttons ---------------- */
+$('#btnImport').addEventListener('click', async () => {
+  spin(true);
+  try {
+    const payload = { modifiedSince:'2025-07-01T00:00:00Z', status: 'AWAITINGPICK' };
+    const res = await fetch('/extensiv/import', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    const data = await res.json();
+    out(data, 'Import result:');
+    await loadData();
+    alert('Import complete.');
+  } catch (e) {
+    console.error(e); alert('Import failed.');
+  } finally { spin(false); }
+});
+
+$('#btnRunSql').addEventListener('click', async () => {
+  if (!confirm('Run SQL allocation across eligible lines?')) return;
+  spin(true);
+  try {
+    const res = await fetch('/extensiv/allocate', { method:'POST' });
+    const data = await res.json();
+    out(data, 'SQL allocation result:');
+    await loadData();
+    alert('Allocation complete.');
+  } catch (e) {
+    console.error(e); alert('Allocation failed.');
+  } finally { spin(false); }
+});
+
+$('#btnPush').addEventListener('click', async () => {
+  if (!confirm('Push SuggAlloc to Extensiv?')) return;
+  spin(true);
+  try {
+    const res = await fetch('/extensiv/push', { method:'POST' });
+    const data = await res.json();
+    out(data, 'Push result:');
+    alert('Push complete.');
+  } catch (e) {
+    console.error(e); alert('Push failed.');
+  } finally { spin(false); }
+});
+
+$('#btnRefresh').addEventListener('click', loadData);
+
+$('#btnAllocate').addEventListener('click', async () => {
+  const ids = currentSelectedLineIds();
+  if (!selectedOrderId) return alert('Pick an order first.');
+  if (!ids.length) return alert('Select at least one line to allocate.');
+
+  spin(true);
+  try {
+    // Your existing endpoint expects { lineIds: [...] }
+    const r = await fetch('/allocateOrders', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ lineIds: ids })
+    });
+    if (!r.ok) throw new Error('Server error');
+    const data = await r.json();
+    out(data, 'Allocate selected order result:');
+    await loadData();
+    alert('Allocation complete for selected order.');
+  } catch (e) {
+    console.error(e); alert('Allocation failed.');
+  } finally { spin(false); }
+});
+
+$('#q').addEventListener('input', () => {
+  const q = $('#q').value.trim().toLowerCase();
+  if (!q) {
+    FILTERED = ORDERS.slice();
+  } else {
+    FILTERED = ORDERS.filter(o => {
+      const inHeader = String(o.orderId).toLowerCase().includes(q) ||
+                       String(o.customerName||'').toLowerCase().includes(q);
+      const inLines  = o.lines.some(l =>
+        String(l.sku||'').toLowerCase().includes(q) ||
+        String(l.qty||'').toLowerCase().includes(q) ||
+        String(l.orderItemId||'').toLowerCase().includes(q)
+      );
+      return inHeader || inLines;
+    });
+  }
+  renderOrders(FILTERED);
+  // keep right panel if current order is still visible; else reset
+  if (!FILTERED.some(o => String(o.orderId) === String(selectedOrderId))) {
+    selectedOrderId = FILTERED[0]?.orderId || null;
+  }
+  renderSelectedPanel();
+});
+
+/* -------------------- boot -------------------- */
+loadData();
+</script>
 </body>
 </html>
