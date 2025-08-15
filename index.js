@@ -18,8 +18,8 @@ import allocateOrders from './app/allocateOrder.js';
 
 // ✅ Correct router path; do NOT import services here
 import extensiv from './app/routes/extensiv.js';
-import allocRouter from "./routes/alloc.js";
-import extensivRouter from "./routes/extensiv.js";
+import allocRouter from "./app/routes/alloc.js";
+import extensivRouter from "./app/routes/extensiv.js";
 
 app.use("/extensiv", extensivRouter);
 app.use("/alloc", allocRouter);
