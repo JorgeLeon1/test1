@@ -2,12 +2,13 @@
 import { Router } from "express";
 import axios from "axios";
 import { getPool, sql } from "../services/db/mssql.js";
-import { authHeaders, fetchSingleOrder, _helpers } from "../services/extensivClient.js";
+import { authHeaders, fetchOneOrderDetail } from "../services/extensivClient.js";
 
 const r = Router();
-const { ro } = _helpers;
 
-// normalize items from order payload
+// local helpers (don't import from extensivClient)
+const ro = (o) => o?.readOnly || o?.ReadOnly || {};
+
 function extractItems(order) {
   const em = order?._embedded?.["http://api.3plCentral.com/rels/orders/item"];
   if (Array.isArray(em)) return em;
@@ -25,9 +26,9 @@ async function upsertOrderDetails(pool, rows) {
   const columns = new Set(colRes.recordset.map(r => r.name));
 
   const defs = [
-    ["OrderId",        sql.Int,        r => r.OrderId],
-    ["OrderItemID",    sql.Int,        r => r.OrderItemID],
-    ["CustomerID",     sql.Int,        r => r.CustomerID],
+    ["OrderId",        sql.Int,         r => r.OrderId],
+    ["OrderItemID",    sql.Int,         r => r.OrderItemID],
+    ["CustomerID",     sql.Int,         r => r.CustomerID],
     ["CustomerName",   sql.VarChar(200),r => r.CustomerName],
     ["ItemID",         sql.VarChar(150),r => r.ItemID],
     ["SKU",            sql.VarChar(150),r => r.SKU],
@@ -88,20 +89,15 @@ ORDER BY i.ItemID, i.Qualifier, i.LocationName;
 
 /* ======================= API ENDPOINTS ======================= */
 
-/**
- * GET /api/single-alloc/order/:id
- * Fetch ONE order (with ALL item details), upsert to dbo.OrderDetails,
- * return normalized order header + lines + matching inventory.
- */
+// GET one order -> upsert lines -> return lines + inventory
 r.get("/order/:id", async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ ok:false, message:"Invalid order id" });
 
-    // 1) fetch from Extensiv
-    const order = await fetchSingleOrder(id);
+    // Fetch single order with ALL item details
+    const order = await fetchOneOrderDetail(id);
 
-    // 2) flatten lines
     const orderRO = ro(order);
     const orderId =
       orderRO.orderId ?? orderRO.OrderId ?? order.orderId ?? order.OrderId ?? id;
@@ -141,11 +137,8 @@ r.get("/order/:id", async (req, res, next) => {
       });
     }
 
-    // 3) upsert lines
     const pool = await getPool();
     const upserts = await upsertOrderDetails(pool, rows);
-
-    // 4) inventory
     const inv = await inventoryForOrder(pool, rows);
 
     res.json({
@@ -164,11 +157,7 @@ r.get("/order/:id", async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-/**
- * POST /api/single-alloc/allocate
- * body: { lineIds: number[] }
- * Runs your while-loop SQL (scoped to those OrderItemIDs) → dbo.SuggAlloc.
- */
+// Run your allocation SQL for selected OrderItemIDs
 r.post("/allocate", async (req, res, next) => {
   try {
     let ids = req.body?.lineIds;
@@ -180,10 +169,8 @@ r.post("/allocate", async (req, res, next) => {
     const idList = lineIds.join(",");
     const pool = await getPool();
 
-    // clear existing suggestions for those lines
     await pool.request().query(`DELETE FROM dbo.SuggAlloc WHERE OrderItemID IN (${idList});`);
 
-    // while-loop allocation (your script; scoped to selected lines)
     await pool.request().query(`
 DECLARE @RemainingOpenQty INT = 1;
 WHILE @RemainingOpenQty > 0
@@ -244,11 +231,7 @@ END
   } catch (e) { next(e); }
 });
 
-/**
- * POST /api/single-alloc/push
- * body: { orderId: number }
- * Builds payload from dbo.SuggAlloc and PUTs to /orders/{orderId}/allocator
- */
+// Push SuggAlloc → Extensiv
 r.post("/push", async (req, res, next) => {
   try {
     const orderId = Number(req.body?.orderId || 0);
