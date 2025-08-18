@@ -55,19 +55,19 @@ async function upsertOrderDetail(pool, cols, rec) {
   req.input("OrderItemID", sql.Int, rec.OrderItemID);
 
   // Only bind what exists in your table
-  const defs = [
-    ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
-    ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
-    ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
-    ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
-    // Mirror SKU to ItemID if ItemID column exists
-    ["ItemID", "ItemID", sql.VarChar(150), s(rec.SKU, 150)],
-    ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
-    ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
-    ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
-    ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
-    ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
-  ];
+ const defs = [
+  ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
+  ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
+  ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
+  ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
+  ["ItemID", "ItemID", sql.VarChar(150), s(rec.ItemID, 150)],   // <-- now real item id
+  ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
+  ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
+  ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
+  ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
+  ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
+];
+
 
   const active = defs.filter(([col]) => cols.has(col));
   active.forEach(([col, param, type, val]) => req.input(param, type, val));
