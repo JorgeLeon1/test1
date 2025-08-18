@@ -166,104 +166,107 @@ r.get("/lines/:orderId", async (req, res) => {
  }
 });
 
-/**
-* POST /api/single-alloc/allocate
-* body: { orderId: number, lineIds: number[] }
-* - clears old SuggAlloc for those lines
-* - runs your iterative allocation SQL scoped to given line IDs
-*/
+// POST /api/single-alloc/allocate
 r.post("/allocate", async (req, res) => {
- try {
-   const { orderId, lineIds } = req.body || {};
-   const oid = toInt(orderId, 0);
-   if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
-   if (!Array.isArray(lineIds) || !lineIds.length) {
-     return res.status(400).json({ ok: false, message: "lineIds required" });
-   }
-
-   const idsCsv = lineIds.map((n) => toInt(n)).filter(Boolean).join(",");
-   if (!idsCsv) return res.status(400).json({ ok: false, message: "lineIds empty after filtering" });
-
-   const pool = await getPool();
-
-   // Clear old suggestions for these specific lines
-   await pool.request().query(`DELETE FROM SuggAlloc WHERE OrderItemID IN (${idsCsv});`);
-
-   // Iterative suggestion logic (uses your sequence & priorities)
-   await pool.request().batch(`
-DECLARE @RemainingOpenQty INT;
-SET @RemainingOpenQty = 1;
-
+  try {
+    const { orderId, lineIds } = req.body || {};
+    const oid = Number.isFinite(Number(orderId)) ? Math.trunc(Number(orderId)) : 0;
+    if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
+    if (!Array.isArray(lineIds) || !lineIds.length) {
+      return res.status(400).json({ ok: false, message: "lineIds required" });
+    }
+ 
+    const idsCsv = lineIds
+      .map(n => Number.isFinite(Number(n)) ? Math.trunc(Number(n)) : 0)
+      .filter(Boolean)
+      .join(",");
+    if (!idsCsv) return res.status(400).json({ ok: false, message: "lineIds empty after filtering" });
+ 
+    const pool = await getPool();
+ 
+    // Clear old suggestions for these specific lines
+    await pool.request().query(`DELETE FROM SuggAlloc WHERE OrderItemID IN (${idsCsv});`);
+ 
+    // === Fixed: no stray alias "c" — use only columns from derived table "a"
+    await pool.request().batch(`
+DECLARE @RemainingOpenQty INT = 1;
+ 
 WHILE @RemainingOpenQty > 0
 BEGIN
- INSERT INTO SuggAlloc (OrderItemID, ReceiveItemID, SuggAllocQty)
- SELECT TOP 1
-   a.OrderItemID,
-   b.ReceiveItemID,
-   CASE
-     WHEN (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQTY THEN b.AvailableQTY
-     ELSE (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0))
-   END AS AllocQty
- FROM (
-   SELECT
-     od.OrderItemID,
-     od.OrderedQTY,
-     inv.ReceiveItemID,
-     inv.AvailableQTY,
-     ISNULL(sa.SumSuggAllocQty,0) AS SumSuggAllocQty,
-     od.OrderedQTY - ISNULL(sa.SumSuggAllocQty,0) AS RemainingOpenQty,
-     inv.LocationName,
-     CASE
-       WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) = inv.AvailableQTY THEN 1
-       WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) = inv.AvailableQTY THEN 2
-       WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) > inv.AvailableQTY THEN 3
-       WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) > inv.AvailableQTY THEN 4
-       WHEN inv.ReceivedQty > inv.AvailableQty  AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >= inv.AvailableQTY THEN 5
-       WHEN inv.ReceivedQty > inv.AvailableQty  AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >= inv.AvailableQTY THEN 6
-       WHEN SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) <= inv.AvailableQTY THEN 7
-       WHEN SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) <= inv.AvailableQTY THEN 8
-     END AS Seq
-   FROM dbo.OrderDetails od
-   LEFT JOIN dbo.Inventory inv
-     ON od.ItemID = inv.ItemID AND od.Qualifier = inv.Qualifier
-   LEFT JOIN (
-     SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
-     FROM SuggAlloc
-     GROUP BY OrderItemID
-   ) sa
-     ON od.OrderItemID = sa.OrderItemID
-   WHERE
-     od.OrderItemID IN (${idsCsv})
-     AND inv.AvailableQTY > 0
-     AND inv.ReceiveItemID NOT IN (SELECT DISTINCT ReceiveItemID FROM SuggAlloc)
- ) a
- WHERE a.RemainingOpenQty > 0
- ORDER BY a.OrderItemID,
-          a.Seq ASC,
-          CASE
-            WHEN a.Seq IN (1,2,3,4,5,6) THEN a.AvailableQTY + 0
-            WHEN a.Seq IN (7,8) THEN 999999 - a.AvailableQTY
-          END DESC;
-
- SET @RemainingOpenQty = (
-   SELECT TOP 1
-     ISNULL(od.OrderedQTY - ISNULL(sa.SumSuggAllocQty,0), 0) AS Remaining
-   FROM dbo.OrderDetails od
-   LEFT JOIN (
-     SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
-     FROM SuggAlloc
-     GROUP BY OrderItemID
-   ) sa ON sa.OrderItemID = od.OrderItemID
-   WHERE od.OrderItemID IN (${idsCsv})
-   ORDER BY Remaining DESC
- );
+  INSERT INTO SuggAlloc (OrderItemID, ReceiveItemID, SuggAllocQty)
+  SELECT TOP 1
+    a.OrderItemID,
+    a.ReceiveItemID,
+    CASE
+      WHEN (a.OrderedQTY - a.SumSuggAllocQty) >= a.AvailableQTY THEN a.AvailableQTY
+      ELSE (a.OrderedQTY - a.SumSuggAllocQty)
+    END AS AllocQty
+  FROM (
+    SELECT
+      od.OrderItemID,
+      od.OrderedQTY,
+      inv.ReceiveItemID,
+      inv.AvailableQTY,
+      ISNULL(sa.SumSuggAllocQty, 0) AS SumSuggAllocQty,
+      od.OrderedQTY - ISNULL(sa.SumSuggAllocQty, 0) AS RemainingOpenQty,
+      inv.LocationName,
+      CASE
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) =  inv.AvailableQTY THEN 1
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) =  inv.AvailableQTY THEN 2
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >  inv.AvailableQTY THEN 3
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >  inv.AvailableQTY THEN 4
+        WHEN inv.ReceivedQty > inv.AvailableQty  AND SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >= inv.AvailableQTY THEN 5
+        WHEN inv.ReceivedQty > inv.AvailableQty  AND SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) >= inv.AvailableQTY THEN 6
+        WHEN SUBSTRING(inv.LocationName,4,1)='A'  AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) <= inv.AvailableQTY THEN 7
+        WHEN SUBSTRING(inv.LocationName,4,1)<>'A' AND (od.OrderedQTY-ISNULL(sa.SumSuggAllocQty,0)) <= inv.AvailableQTY THEN 8
+      END AS Seq
+    FROM dbo.OrderDetails od
+    LEFT JOIN dbo.Inventory inv
+      ON od.ItemID = inv.ItemID
+     AND od.Qualifier = inv.Qualifier
+    LEFT JOIN (
+      SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
+      FROM SuggAlloc
+      GROUP BY OrderItemID
+    ) sa
+      ON sa.OrderItemID = od.OrderItemID
+    WHERE od.OrderItemID IN (${idsCsv})
+      AND inv.AvailableQTY > 0
+      AND NOT EXISTS (
+        SELECT 1
+        FROM SuggAlloc x
+        WHERE x.ReceiveItemID = inv.ReceiveItemID
+      )
+  ) a
+  WHERE a.RemainingOpenQty > 0
+    AND (a.OrderedQTY - a.SumSuggAllocQty) > 0
+  ORDER BY a.OrderItemID,
+           a.Seq ASC,
+           CASE
+             WHEN a.Seq IN (1,2,3,4,5,6) THEN a.AvailableQTY
+             WHEN a.Seq IN (7,8) THEN 999999 - a.AvailableQTY
+           END DESC;
+ 
+  -- recompute the largest remaining need across the selected lines
+  SET @RemainingOpenQty = (
+    SELECT MAX(od.OrderedQTY - ISNULL(sa.SumSuggAllocQty,0))
+    FROM dbo.OrderDetails od
+    LEFT JOIN (
+      SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumSuggAllocQty
+      FROM SuggAlloc
+      GROUP BY OrderItemID
+    ) sa ON sa.OrderItemID = od.OrderItemID
+    WHERE od.OrderItemID IN (${idsCsv})
+  );
+ 
+  IF @RemainingOpenQty IS NULL SET @RemainingOpenQty = 0;
 END
-   `);
-
-   res.json({ ok: true, orderId: oid, linesAffected: lineIds.length });
- } catch (e) {
-   res.status(500).json({ ok: false, message: e.message });
- }
+    `);
+ 
+    res.json({ ok: true, orderId: oid, linesAffected: lineIds.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
 /**
