@@ -12,7 +12,9 @@ const toInt = (v, d = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) 
 const s = (v, max = 255) => (v == null ? "" : String(v).normalize("NFC").slice(0, max));
 
 async function fetchSingleOrderFromExtensiv(orderId) {
-  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const base = trimBase(
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+  );
   const headers = await authHeaders();
 
   const { data, status } = await axios.get(`${base}/orders/${orderId}`, {
@@ -23,6 +25,7 @@ async function fetchSingleOrderFromExtensiv(orderId) {
   });
 
   if (status >= 200 && status < 300) return data;
+
   const msg = (data && (data.message || data.error)) || `Extensiv returned ${status}`;
   const err = new Error(msg);
   err.status = status;
@@ -54,20 +57,19 @@ async function upsertOrderDetail(pool, cols, rec) {
   const req = pool.request();
   req.input("OrderItemID", sql.Int, rec.OrderItemID);
 
-  // Only bind what exists in your table
- const defs = [
-  ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
-  ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
-  ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
-  ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
-  ["ItemID", "ItemID", sql.VarChar(150), s(rec.ItemID, 150)],   // <-- now real item id
-  ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
-  ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
-  ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
-  ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
-  ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
-];
-
+  const defs = [
+    ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
+    ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
+    ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
+    ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
+    // store the TRUE item id from Extensiv (do NOT mirror sku)
+    ["ItemID", "ItemID", sql.VarChar(150), s(rec.ItemID, 150)],
+    ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
+    ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
+    ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
+    ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
+    ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
+  ];
 
   const active = defs.filter(([col]) => cols.has(col));
   active.forEach(([col, param, type, val]) => req.input(param, type, val));
@@ -87,12 +89,14 @@ ELSE
 
 /* -------------------------- Routes -------------------------- */
 
-// sanity
+// sanity check
 r.get("/ping", (_req, res) => res.json({ ok: true, where: "single-alloc" }));
 
 /**
  * GET /api/single-alloc/order/:id
- * - pulls one order (detail=All&itemdetail=All), upserts lines into dbo.OrderDetails, returns header+lines
+ * - pulls one order from Extensiv (detail=All&itemdetail=All)
+ * - upserts its lines into dbo.OrderDetails
+ * - returns normalized header + lines
  */
 r.get("/order/:id", async (req, res) => {
   try {
@@ -117,36 +121,43 @@ r.get("/order/:id", async (req, res) => {
 
     for (const it of linesRaw) {
       const iro = it?.readOnly || it?.ReadOnly || {};
-      // AFTER – grab a real itemId and a robust SKU
-const rawItemId = toInt(
-  it?.itemIdentifier?.id ??
-  it?.ItemIdentifier?.Id ??
-  it?.itemIdentifierId ??
-  it?.ItemId, 0);
 
-const sku = s(
-  it?.itemIdentifier?.sku ??
-  it?.ItemIdentifier?.Sku ??
-  it?.sku ??
-  it?.SKU ??
-  it?.itemIdentifier?.nameKey?.name ??   // last-ditch fallbacks
-  it?.itemIdentifier?.name ??
-  "", 150
-);
+      // TRUE itemId and robust sku extraction
+      const rawItemId = toInt(
+        it?.itemIdentifier?.id ??
+        it?.ItemIdentifier?.Id ??
+        it?.itemIdentifierId ??
+        it?.ItemId,
+        0
+      );
 
-const line = {
-  OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
-  OrderID: orderHeader.orderId,
-  CustomerID: orderHeader.customerId,
-  CustomerName: orderHeader.customerName,
-  ItemID: rawItemId ? String(rawItemId) : "",    // store true item id (string ok)
-  SKU: sku,
-  Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
-  OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
-  UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
-  UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
-  ReferenceNum: orderHeader.referenceNum,
-};
+      const sku = s(
+        it?.itemIdentifier?.sku ??
+          it?.ItemIdentifier?.Sku ??
+          it?.sku ??
+          it?.SKU ??
+          it?.itemIdentifier?.nameKey?.name ??
+          it?.itemIdentifier?.name ??
+          "",
+        150
+      );
+
+      const line = {
+        OrderItemID: toInt(
+          iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId,
+          0
+        ),
+        OrderID: orderHeader.orderId,
+        CustomerID: orderHeader.customerId,
+        CustomerName: orderHeader.customerName,
+        ItemID: rawItemId ? String(rawItemId) : "",
+        SKU: sku,
+        Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
+        OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
+        UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
+        UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
+        ReferenceNum: orderHeader.referenceNum,
+      };
 
       if (!line.OrderItemID) continue;
       await upsertOrderDetail(pool, cols, line);
@@ -161,25 +172,22 @@ const line = {
 
 /**
  * GET /api/single-alloc/lines/:orderId
- * - convenience: read the lines you stored for this order
+ * - convenience for UI to load the lines we stored for this order
  */
 r.get("/lines/:orderId", async (req, res) => {
   try {
     const orderId = toInt(req.params.orderId, 0);
     if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
-
     const pool = await getPool();
     const q = await pool
       .request()
       .input("OrderID", sql.Int, orderId)
-      .query(`
-        SELECT OrderItemID, OrderID, CustomerID, CustomerName, ItemID, SKU, Qualifier,
-               OrderedQTY, UnitID, UnitName, ReferenceNum
-        FROM dbo.OrderDetails
-        WHERE OrderID=@OrderID
-        ORDER BY OrderItemID
-      `);
-
+      .query(
+        `SELECT OrderItemID, OrderID, CustomerID, CustomerName, ItemID, SKU, Qualifier, OrderedQTY, UnitID, UnitName, ReferenceNum
+         FROM dbo.OrderDetails
+         WHERE OrderID=@OrderID
+         ORDER BY OrderItemID`
+      );
     res.json({ ok: true, orderId, lines: q.recordset });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
@@ -189,6 +197,7 @@ r.get("/lines/:orderId", async (req, res) => {
 /**
  * POST /api/single-alloc/allocate
  * body: { orderId: number, lineIds: number[] }
+ * - runs suggestion loop just for chosen lines
  */
 r.post("/allocate", async (req, res) => {
   try {
@@ -205,14 +214,12 @@ r.post("/allocate", async (req, res) => {
     const pool = await getPool();
 
     // Clear old suggestions for these specific lines
-    await pool.request().query(`
-      DELETE SuggAlloc WHERE OrderItemID IN (${ids.join(",")});
-    `);
+    await pool.request().query(`DELETE SuggAlloc WHERE OrderItemID IN (${ids.join(",")});`);
 
-    // Safe terminating allocation loop using CTEs (no "c.SumSuggAllocQty" binding issues)
+    // Safe, terminating allocation loop
     await pool.request().batch(`
 DECLARE @iters INT = 0;
-DECLARE @maxIters INT = 10000; -- safety cap
+DECLARE @maxIters INT = 10000;
 
 WHILE (1=1)
 BEGIN
@@ -241,8 +248,8 @@ BEGIN
       inv.ReceivedQty,
       inv.LocationName,
       CASE
-        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND x.RemainingOpenQty = inv.AvailableQTY THEN 1
-        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND x.RemainingOpenQty = inv.AvailableQTY THEN 2
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND x.RemainingOpenQty =  inv.AvailableQTY THEN 1
+        WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND x.RemainingOpenQty =  inv.AvailableQTY THEN 2
         WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)<>'A' AND x.RemainingOpenQty >  inv.AvailableQTY THEN 3
         WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND x.RemainingOpenQty >  inv.AvailableQTY THEN 4
         WHEN inv.ReceivedQty >  inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1)='A'  AND x.RemainingOpenQty >= inv.AvailableQTY THEN 5
@@ -253,10 +260,16 @@ BEGIN
     FROM x
     JOIN OrderDetails od ON od.OrderItemID = x.OrderItemID
     JOIN Inventory inv
-      ON inv.ItemID = od.ItemID
-     AND inv.Qualifier = od.Qualifier
-    WHERE
-      x.RemainingOpenQty > 0
+      ON (
+           (od.ItemID IS NOT NULL AND od.ItemID <> '' AND inv.ItemID = od.ItemID)
+           OR
+           ((od.ItemID IS NULL OR od.ItemID = '') AND inv.SKU = od.SKU)
+         )
+     AND (
+           inv.Qualifier = od.Qualifier
+           OR (od.Qualifier IS NULL OR od.Qualifier = '')
+         )
+    WHERE x.RemainingOpenQty > 0
       AND inv.AvailableQTY > 0
       AND inv.ReceiveItemID NOT IN (SELECT DISTINCT ReceiveItemID FROM SuggAlloc)
   ),
@@ -264,10 +277,7 @@ BEGIN
     SELECT TOP (1)
       c.OrderItemID,
       c.ReceiveItemID,
-      CASE
-        WHEN c.RemainingOpenQty >= c.AvailableQTY THEN c.AvailableQTY
-        ELSE c.RemainingOpenQty
-      END AS AllocQty,
+      CASE WHEN c.RemainingOpenQty >= c.AvailableQTY THEN c.AvailableQTY ELSE c.RemainingOpenQty END AS AllocQty,
       c.Seq,
       c.AvailableQTY
     FROM cand c
@@ -281,6 +291,7 @@ BEGIN
   FROM pick;
 
   IF @@ROWCOUNT = 0 BREAK;
+
   SET @iters += 1;
   IF @iters >= @maxIters BREAK;
 
@@ -344,6 +355,7 @@ r.get("/sugg/:orderId", async (req, res) => {
 /**
  * POST /api/single-alloc/push
  * body: { orderId: number }
+ * - pushes current SuggAlloc for the order to Extensiv allocator endpoint (with If-Match ETag)
  */
 r.post("/push", async (req, res) => {
   try {
@@ -351,12 +363,15 @@ r.post("/push", async (req, res) => {
     if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
 
     const pool = await getPool();
-    const allocs = await pool.request().input("OrderID", sql.Int, oid).query(`
-      SELECT OrderItemID, ReceiveItemID, SuggAllocQty
-      FROM SuggAlloc
-      WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
-        AND ISNULL(SuggAllocQty,0) > 0
-    `);
+    const allocs = await pool
+      .request()
+      .input("OrderID", sql.Int, oid)
+      .query(`
+        SELECT OrderItemID, ReceiveItemID, SuggAllocQty
+        FROM SuggAlloc
+        WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
+          AND ISNULL(SuggAllocQty,0) > 0
+      `);
 
     const payload = {
       allocations: allocs.recordset.map((a) => ({
@@ -366,8 +381,27 @@ r.post("/push", async (req, res) => {
       })),
     };
 
-    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
-    const headers = await authHeaders();
+    const base = trimBase(
+      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+    );
+    const auth = await authHeaders();
+
+    // Get the ETag first
+    const pre = await axios.get(`${base}/orders/${oid}`, {
+      headers: auth,
+      timeout: 20000,
+      validateStatus: () => true,
+    });
+    if (pre.status < 200 || pre.status >= 300) {
+      return res
+        .status(pre.status)
+        .json({ ok: false, message: "Failed to read order before push", data: pre.data });
+    }
+    const etag = pre.headers?.etag || pre.headers?.ETag;
+    const headers = { ...auth };
+    if (etag) headers["If-Match"] = etag;
+
+    // Push allocations
     const resp = await axios.put(`${base}/orders/${oid}/allocator`, payload, {
       headers,
       timeout: 30000,
