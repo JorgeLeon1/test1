@@ -12,184 +12,188 @@ const toInt = (v, d = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) 
 const s = (v, max = 255) => (v == null ? "" : String(v).normalize("NFC").slice(0, max));
 
 async function fetchSingleOrderFromExtensiv(orderId) {
- const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
- const headers = await authHeaders();
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+  const headers = await authHeaders();
 
- const { data, status } = await axios.get(`${base}/orders/${orderId}`, {
-   headers,
-   params: { detail: "All", itemdetail: "All" },
-   timeout: 30000,
-   validateStatus: () => true,
- });
+  const { data, status } = await axios.get(`${base}/orders/${orderId}`, {
+    headers,
+    params: { detail: "All", itemdetail: "All" },
+    timeout: 30000,
+    validateStatus: () => true,
+  });
 
- if (status >= 200 && status < 300) return data;
-
- // Make error obvious to the UI
- const msg = (data && (data.message || data.error)) || `Extensiv returned ${status}`;
- const err = new Error(msg);
- err.status = status;
- err.data = data;
- throw err;
+  if (status >= 200 && status < 300) return data;
+  const msg = (data && (data.message || data.error)) || `Extensiv returned ${status}`;
+  const err = new Error(msg);
+  err.status = status;
+  err.data = data;
+  throw err;
 }
 
 function linesFromOrderPayload(ord) {
- const emb = ord?._embedded;
- if (emb?.["http://api.3plCentral.com/rels/orders/item"]) {
-   return emb["http://api.3plCentral.com/rels/orders/item"];
- }
- if (Array.isArray(ord?.OrderItems)) return ord.OrderItems;
- if (Array.isArray(ord?.Items)) return ord.Items;
- return [];
+  const emb = ord?._embedded;
+  if (emb?.["http://api.3plCentral.com/rels/orders/item"]) {
+    return emb["http://api.3plCentral.com/rels/orders/item"];
+  }
+  if (Array.isArray(ord?.OrderItems)) return ord.OrderItems;
+  if (Array.isArray(ord?.Items)) return ord.Items;
+  return [];
 }
 
 /* ------- upsert into dbo.OrderDetails (only existing columns) ------- */
 async function getExistingCols(pool) {
- const q = await pool
-   .request()
-   .query("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')");
- return new Set(q.recordset.map((r) => r.name));
+  const q = await pool
+    .request()
+    .query("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')");
+  return new Set(q.recordset.map((r) => r.name));
 }
 
 async function upsertOrderDetail(pool, cols, rec) {
- if (!rec.OrderItemID) return;
+  if (!rec.OrderItemID) return;
 
- const req = pool.request();
- req.input("OrderItemID", sql.Int, rec.OrderItemID);
+  const req = pool.request();
+  req.input("OrderItemID", sql.Int, rec.OrderItemID);
 
- // Only bind what exists in your table
- const defs = [
-   ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
-   ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
-   ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
-   ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
-   // If ItemID column exists but you want SKU mirrored into it:
-   ["ItemID", "ItemID", sql.VarChar(150), s(rec.SKU, 150)],
-   ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
-   ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
-   ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
-   ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
-   ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
- ];
+  // Only bind what exists in your table
+  const defs = [
+    ["OrderID", "OrderID", sql.Int, toInt(rec.OrderID, 0)],
+    ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
+    ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
+    ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
+    // Mirror SKU to ItemID if ItemID column exists
+    ["ItemID", "ItemID", sql.VarChar(150), s(rec.SKU, 150)],
+    ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
+    ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
+    ["UnitID", "UnitID", sql.Int, toInt(rec.UnitID, 0)],
+    ["UnitName", "UnitName", sql.VarChar(80), s(rec.UnitName, 80)],
+    ["ReferenceNum", "ReferenceNum", sql.VarChar(120), s(rec.ReferenceNum, 120)],
+  ];
 
- const active = defs.filter(([col]) => cols.has(col));
- active.forEach(([col, param, type, val]) => req.input(param, type, val));
+  const active = defs.filter(([col]) => cols.has(col));
+  active.forEach(([col, param, type, val]) => req.input(param, type, val));
 
- const setClause = active.map(([col, param]) => `${col}=@${param}`).join(", ");
- const insertCols = ["OrderItemID", ...active.map(([col]) => col)].join(", ");
- const insertVals = ["@OrderItemID", ...active.map(([, p]) => `@${p}`)].join(", ");
+  const setClause = active.map(([col, param]) => `${col}=@${param}`).join(", ");
+  const insertCols = ["OrderItemID", ...active.map(([col]) => col)].join(", ");
+  const insertVals = ["@OrderItemID", ...active.map(([, p]) => `@${p}`)].join(", ");
 
- const sqlText = `
+  const sqlText = `
 IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
- UPDATE dbo.OrderDetails SET ${setClause} WHERE OrderItemID=@OrderItemID;
+  UPDATE dbo.OrderDetails SET ${setClause} WHERE OrderItemID=@OrderItemID;
 ELSE
- INSERT INTO dbo.OrderDetails (${insertCols}) VALUES (${insertVals});
+  INSERT INTO dbo.OrderDetails (${insertCols}) VALUES (${insertVals});
 `;
- await req.query(sqlText);
+  await req.query(sqlText);
 }
 
 /* -------------------------- Routes -------------------------- */
 
-// quick sanity ping
+// sanity
 r.get("/ping", (_req, res) => res.json({ ok: true, where: "single-alloc" }));
 
 /**
-* GET /api/single-alloc/order/:id
-* - pulls one order from Extensiv (detail=All&itemdetail=All)
-* - upserts its lines into dbo.OrderDetails
-* - returns normalized header + lines
-*/
+ * GET /api/single-alloc/order/:id
+ * - pulls one order (detail=All&itemdetail=All), upserts lines into dbo.OrderDetails, returns header+lines
+ */
 r.get("/order/:id", async (req, res) => {
- try {
-   const orderId = toInt(req.params.id, 0);
-   if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
+  try {
+    const orderId = toInt(req.params.id, 0);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
 
-   const raw = await fetchSingleOrderFromExtensiv(orderId);
+    const raw = await fetchSingleOrderFromExtensiv(orderId);
 
-   const ro = raw?.readOnly || raw?.ReadOnly || {};
-   const orderHeader = {
-     orderId: toInt(ro.orderId ?? ro.OrderId ?? raw.orderId ?? raw.OrderId ?? orderId, orderId),
-     customerId: toInt(raw?.customerIdentifier?.id, 0),
-     customerName: s(raw?.customerIdentifier?.name, 200),
-     referenceNum: s(raw?.referenceNum, 120),
-   };
+    const ro = raw?.readOnly || raw?.ReadOnly || {};
+    const orderHeader = {
+      orderId: toInt(ro.orderId ?? ro.OrderId ?? raw.orderId ?? raw.OrderId ?? orderId, orderId),
+      customerId: toInt(raw?.customerIdentifier?.id, 0),
+      customerName: s(raw?.customerIdentifier?.name, 200),
+      referenceNum: s(raw?.referenceNum, 120),
+    };
 
-   const pool = await getPool();
-   const cols = await getExistingCols(pool);
+    const pool = await getPool();
+    const cols = await getExistingCols(pool);
 
-   const linesRaw = linesFromOrderPayload(raw);
-   const lines = [];
+    const linesRaw = linesFromOrderPayload(raw);
+    const lines = [];
 
-   for (const it of linesRaw) {
-     const iro = it?.readOnly || it?.ReadOnly || {};
-     const line = {
-       OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
-       OrderID: orderHeader.orderId,
-       CustomerID: orderHeader.customerId,
-       CustomerName: orderHeader.customerName,
-       SKU: s(it?.itemIdentifier?.sku ?? it?.sku ?? it?.SKU ?? "", 150),
-       Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
-       OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
-       UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
-       UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
-       ReferenceNum: orderHeader.referenceNum,
-     };
-     if (!line.OrderItemID) continue;
-     await upsertOrderDetail(pool, cols, line);
-     lines.push(line);
-   }
+    for (const it of linesRaw) {
+      const iro = it?.readOnly || it?.ReadOnly || {};
+      const line = {
+        OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
+        OrderID: orderHeader.orderId,
+        CustomerID: orderHeader.customerId,
+        CustomerName: orderHeader.customerName,
+        SKU: s(it?.itemIdentifier?.sku ?? it?.sku ?? it?.SKU ?? "", 150),
+        Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
+        OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
+        UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
+        UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
+        ReferenceNum: orderHeader.referenceNum,
+      };
+      if (!line.OrderItemID) continue;
+      await upsertOrderDetail(pool, cols, line);
+      lines.push(line);
+    }
 
-   res.json({ ok: true, order: orderHeader, lines });
- } catch (e) {
-   res.status(e.status || 500).json({ ok: false, message: e.message, data: e.data });
- }
+    res.json({ ok: true, order: orderHeader, lines });
+  } catch (e) {
+    res.status(e.status || 500).json({ ok: false, message: e.message, data: e.data });
+  }
 });
 
 /**
-* GET /api/single-alloc/lines/:orderId
-* - convenience for UI to load the lines we stored for this order
-*/
+ * GET /api/single-alloc/lines/:orderId
+ * - convenience: read the lines you stored for this order
+ */
 r.get("/lines/:orderId", async (req, res) => {
- try {
-   const orderId = toInt(req.params.orderId, 0);
-   if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
-   const pool = await getPool();
-   const q = await pool
-     .request()
-     .input("OrderID", sql.Int, orderId)
-     .query(`SELECT OrderItemID, OrderID, CustomerID, CustomerName, ItemID, SKU, Qualifier, OrderedQTY, UnitID, UnitName, ReferenceNum
-             FROM dbo.OrderDetails
-             WHERE OrderID=@OrderID
-             ORDER BY OrderItemID`);
-   res.json({ ok: true, orderId, lines: q.recordset });
- } catch (e) {
-   res.status(500).json({ ok: false, message: e.message });
- }
+  try {
+    const orderId = toInt(req.params.orderId, 0);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
+
+    const pool = await getPool();
+    const q = await pool
+      .request()
+      .input("OrderID", sql.Int, orderId)
+      .query(`
+        SELECT OrderItemID, OrderID, CustomerID, CustomerName, ItemID, SKU, Qualifier,
+               OrderedQTY, UnitID, UnitName, ReferenceNum
+        FROM dbo.OrderDetails
+        WHERE OrderID=@OrderID
+        ORDER BY OrderItemID
+      `);
+
+    res.json({ ok: true, orderId, lines: q.recordset });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
-// POST /api/single-alloc/allocate
+/**
+ * POST /api/single-alloc/allocate
+ * body: { orderId: number, lineIds: number[] }
+ */
 r.post("/allocate", async (req, res) => {
   try {
     const { orderId, lineIds } = req.body || {};
     const oid = Number.parseInt(orderId, 10) || 0;
-    if (!oid) return res.status(400).json({ ok:false, message:"orderId required" });
+    if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
     if (!Array.isArray(lineIds) || !lineIds.length) {
-      return res.status(400).json({ ok:false, message:"lineIds required" });
+      return res.status(400).json({ ok: false, message: "lineIds required" });
     }
 
-    const ids = lineIds.map(n => Number.parseInt(n,10)).filter(Boolean);
-    if (!ids.length) return res.status(400).json({ ok:false, message:"no valid lineIds" });
+    const ids = lineIds.map((n) => Number.parseInt(n, 10)).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ ok: false, message: "no valid lineIds" });
 
     const pool = await getPool();
 
-    // Clear old suggestions for these specific lines (optional but recommended)
+    // Clear old suggestions for these specific lines
     await pool.request().query(`
       DELETE SuggAlloc WHERE OrderItemID IN (${ids.join(",")});
     `);
 
-    // Safe, terminating allocation loop
+    // Safe terminating allocation loop using CTEs (no "c.SumSuggAllocQty" binding issues)
     await pool.request().batch(`
 DECLARE @iters INT = 0;
-DECLARE @maxIters INT = 10000; -- hard safety
+DECLARE @maxIters INT = 10000; -- safety cap
 
 WHILE (1=1)
 BEGIN
@@ -197,7 +201,7 @@ BEGIN
     SELECT
       od.OrderItemID,
       od.OrderedQTY,
-      ISNULL(sa.SumSuggAllocQty,0)          AS SumSuggAllocQty,
+      ISNULL(sa.SumSuggAllocQty,0) AS SumSuggAllocQty,
       (od.OrderedQTY - ISNULL(sa.SumSuggAllocQty,0)) AS RemainingOpenQty
     FROM OrderDetails od
     LEFT JOIN (
@@ -235,9 +239,7 @@ BEGIN
     WHERE
       x.RemainingOpenQty > 0
       AND inv.AvailableQTY > 0
-      AND inv.ReceiveItemID NOT IN (
-        SELECT DISTINCT ReceiveItemID FROM SuggAlloc
-      )
+      AND inv.ReceiveItemID NOT IN (SELECT DISTINCT ReceiveItemID FROM SuggAlloc)
   ),
   pick AS (
     SELECT TOP (1)
@@ -259,13 +261,10 @@ BEGIN
   SELECT OrderItemID, ReceiveItemID, AllocQty
   FROM pick;
 
-  -- If nothing was inserted this iteration, break to avoid infinite loop
   IF @@ROWCOUNT = 0 BREAK;
-
   SET @iters += 1;
   IF @iters >= @maxIters BREAK;
 
-  -- If all selected lines are fully allocated, stop
   IF NOT EXISTS (
     SELECT 1
     FROM OrderDetails od
@@ -281,7 +280,6 @@ BEGIN
 END;
     `);
 
-    // Return a quick summary for the client UI
     const summary = await pool.request().query(`
       SELECT od.OrderItemID, od.SKU, od.OrderedQTY,
              ISNULL(x.Alloc,0) AS Allocated,
@@ -295,83 +293,75 @@ END;
       ORDER BY od.OrderItemID;
     `);
 
-    res.json({ ok:true, orderId: oid, summary: summary.recordset });
+    res.json({ ok: true, orderId: oid, summary: summary.recordset });
   } catch (e) {
-    res.status(500).json({ ok:false, message: e.message });
-  }
-});
-
- 
-    res.json({ ok: true, orderId: oid, linesAffected: lineIds.length });
-   catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
 });
 
 /**
-* GET /api/single-alloc/sugg/:orderId
-* - read current SuggAlloc for this order (for UI preview)
-*/
+ * GET /api/single-alloc/sugg/:orderId
+ * - read current SuggAlloc for this order (for UI preview)
+ */
 r.get("/sugg/:orderId", async (req, res) => {
- try {
-   const orderId = toInt(req.params.orderId, 0);
-   if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
+  try {
+    const orderId = toInt(req.params.orderId, 0);
+    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
 
-   const pool = await getPool();
-   const q = await pool.request().input("OrderID", sql.Int, orderId).query(`
-     SELECT sa.OrderItemID, sa.ReceiveItemID, sa.SuggAllocQty
-     FROM SuggAlloc sa
-     WHERE sa.OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
-     ORDER BY sa.OrderItemID, sa.ReceiveItemID
-   `);
+    const pool = await getPool();
+    const q = await pool.request().input("OrderID", sql.Int, orderId).query(`
+      SELECT sa.OrderItemID, sa.ReceiveItemID, sa.SuggAllocQty
+      FROM SuggAlloc sa
+      WHERE sa.OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
+      ORDER BY sa.OrderItemID, sa.ReceiveItemID
+    `);
 
-   res.json({ ok: true, orderId, allocations: q.recordset });
- } catch (e) {
-   res.status(500).json({ ok: false, message: e.message });
- }
+    res.json({ ok: true, orderId, allocations: q.recordset });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message });
+  }
 });
 
 /**
-* POST /api/single-alloc/push
-* body: { orderId: number }
-* - pushes current SuggAlloc for the order to Extensiv allocator endpoint
-*/
+ * POST /api/single-alloc/push
+ * body: { orderId: number }
+ */
 r.post("/push", async (req, res) => {
- try {
-   const oid = toInt(req.body?.orderId, 0);
-   if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
+  try {
+    const oid = toInt(req.body?.orderId, 0);
+    if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
 
-   const pool = await getPool();
-   const allocs = await pool.request().input("OrderID", sql.Int, oid).query(`
-     SELECT OrderItemID, ReceiveItemID, SuggAllocQty
-     FROM SuggAlloc
-     WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
-       AND ISNULL(SuggAllocQty,0) > 0
-   `);
+    const pool = await getPool();
+    const allocs = await pool.request().input("OrderID", sql.Int, oid).query(`
+      SELECT OrderItemID, ReceiveItemID, SuggAllocQty
+      FROM SuggAlloc
+      WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
+        AND ISNULL(SuggAllocQty,0) > 0
+    `);
 
-   const payload = {
-     allocations: allocs.recordset.map((a) => ({
-       orderItemId: a.OrderItemID,
-       receiveItemId: a.ReceiveItemID,
-       qty: a.SuggAllocQty,
-     })),
-   };
+    const payload = {
+      allocations: allocs.recordset.map((a) => ({
+        orderItemId: a.OrderItemID,
+        receiveItemId: a.ReceiveItemID,
+        qty: a.SuggAllocQty,
+      })),
+    };
 
-   const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
-   const headers = await authHeaders();
-   const resp = await axios.put(`${base}/orders/${oid}/allocator`, payload, {
-     headers,
-     timeout: 30000,
-     validateStatus: () => true,
-   });
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+    const headers = await authHeaders();
+    const resp = await axios.put(`${base}/orders/${oid}/allocator`, payload, {
+      headers,
+      timeout: 30000,
+      validateStatus: () => true,
+    });
 
-   if (resp.status >= 200 && resp.status < 300) {
-     return res.json({ ok: true, status: resp.status, sent: payload.allocations.length });
-   }
-   res.status(resp.status || 500).json({ ok: false, status: resp.status, data: resp.data });
- } catch (e) {
-   res.status(500).json({ ok: false, message: e.message, data: e.response?.data });
- }
+    if (resp.status >= 200 && resp.status < 300) {
+      return res.json({ ok: true, status: resp.status, sent: payload.allocations.length });
+    }
+    res.status(resp.status || 500).json({ ok: false, status: resp.status, data: resp.data });
+  } catch (e) {
+    res.status(500).json({ ok: false, message: e.message, data: e.response?.data });
+  }
 });
 
 export default r;
