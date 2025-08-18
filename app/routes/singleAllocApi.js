@@ -117,18 +117,37 @@ r.get("/order/:id", async (req, res) => {
 
     for (const it of linesRaw) {
       const iro = it?.readOnly || it?.ReadOnly || {};
-      const line = {
-        OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
-        OrderID: orderHeader.orderId,
-        CustomerID: orderHeader.customerId,
-        CustomerName: orderHeader.customerName,
-        SKU: s(it?.itemIdentifier?.sku ?? it?.sku ?? it?.SKU ?? "", 150),
-        Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
-        OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
-        UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
-        UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
-        ReferenceNum: orderHeader.referenceNum,
-      };
+      // AFTER – grab a real itemId and a robust SKU
+const rawItemId = toInt(
+  it?.itemIdentifier?.id ??
+  it?.ItemIdentifier?.Id ??
+  it?.itemIdentifierId ??
+  it?.ItemId, 0);
+
+const sku = s(
+  it?.itemIdentifier?.sku ??
+  it?.ItemIdentifier?.Sku ??
+  it?.sku ??
+  it?.SKU ??
+  it?.itemIdentifier?.nameKey?.name ??   // last-ditch fallbacks
+  it?.itemIdentifier?.name ??
+  "", 150
+);
+
+const line = {
+  OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
+  OrderID: orderHeader.orderId,
+  CustomerID: orderHeader.customerId,
+  CustomerName: orderHeader.customerName,
+  ItemID: rawItemId ? String(rawItemId) : "",    // store true item id (string ok)
+  SKU: sku,
+  Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
+  OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ?? 0, 0),
+  UnitID: toInt(iro?.unitIdentifier?.id ?? iro?.UnitIdentifier?.Id, 0),
+  UnitName: s(iro?.unitIdentifier?.name ?? iro?.UnitIdentifier?.Name ?? "", 80),
+  ReferenceNum: orderHeader.referenceNum,
+};
+
       if (!line.OrderItemID) continue;
       await upsertOrderDetail(pool, cols, line);
       lines.push(line);
