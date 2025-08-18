@@ -303,7 +303,7 @@ END;
 
  
     res.json({ ok: true, orderId: oid, linesAffected: lineIds.length });
-  } catch (e) {
+   catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
 });
