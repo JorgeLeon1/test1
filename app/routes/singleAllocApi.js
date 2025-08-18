@@ -12,18 +12,15 @@ const toInt = (v, d = 0) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) 
 const s = (v, max = 255) => (v == null ? "" : String(v).normalize("NFC").slice(0, max));
 
 async function fetchSingleOrderFromExtensiv(orderId) {
-  const base = trimBase(
-    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
-  );
+  const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
   const headers = await authHeaders();
 
-  // Get one order with all details and item details
   const { data } = await axios.get(`${base}/orders/${orderId}`, {
     headers,
     params: { detail: "All", itemdetail: "All" },
     timeout: 30000,
   });
-  return data; // raw order payload
+  return data;
 }
 
 function linesFromOrderPayload(ord) {
@@ -36,12 +33,11 @@ function linesFromOrderPayload(ord) {
   return [];
 }
 
-/* ------- upsert into dbo.OrderDetails (only existing columns) ------- */
 async function getExistingCols(pool) {
-  const q = await pool
-    .request()
-    .query("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')");
-  return new Set(q.recordset.map((r) => r.name));
+  const q = await pool.request().query(
+    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.OrderDetails')"
+  );
+  return new Set(q.recordset.map(r => r.name));
 }
 
 async function upsertOrderDetail(pool, cols, rec) {
@@ -55,7 +51,6 @@ async function upsertOrderDetail(pool, cols, rec) {
     ["CustomerID", "CustomerID", sql.Int, toInt(rec.CustomerID, 0)],
     ["CustomerName", "CustomerName", sql.VarChar(200), s(rec.CustomerName, 200)],
     ["SKU", "SKU", sql.VarChar(150), s(rec.SKU, 150)],
-    // mirror SKU into ItemID if that column exists
     ["ItemID", "ItemID", sql.VarChar(150), s(rec.SKU, 150)],
     ["Qualifier", "Qualifier", sql.VarChar(80), s(rec.Qualifier, 80)],
     ["OrderedQTY", "OrderedQTY", sql.Int, toInt(rec.OrderedQTY, 0)],
@@ -66,9 +61,9 @@ async function upsertOrderDetail(pool, cols, rec) {
   const active = defs.filter(([c]) => cols.has(c));
   active.forEach(([c, p, type, val]) => req.input(p, type, val));
 
-  const setClause = active.map(([c, p]) => `${c}=@${p}`).join(", ");
-  const insertCols = ["OrderItemID", ...active.map(([c]) => c)].join(", ");
-  const insertVals = ["@OrderItemID", ...active.map(([, p]) => `@${p}`)].join(", ");
+  const setClause   = active.map(([c, p]) => `${c}=@${p}`).join(", ");
+  const insertCols  = ["OrderItemID", ...active.map(([c]) => c)].join(", ");
+  const insertVals  = ["@OrderItemID", ...active.map(([,p]) => `@${p}`)].join(", ");
 
   const sqlText = `
 IF EXISTS (SELECT 1 FROM dbo.OrderDetails WITH (UPDLOCK, HOLDLOCK) WHERE OrderItemID=@OrderItemID)
@@ -81,19 +76,13 @@ ELSE
 
 /* -------------------------- Routes -------------------------- */
 
-// sanity check
 r.get("/ping", (_req, res) => res.json({ ok: true, where: "single-alloc" }));
 
-/**
- * GET /api/single-alloc/order/:id
- * - fetch one order from Extensiv with detail=All&itemdetail=All
- * - upsert lines into dbo.OrderDetails
- * - return { order, lines, inventory }
- */
+// GET /api/single-alloc/order/:id
 r.get("/order/:id", async (req, res) => {
   try {
     const orderId = toInt(req.params.id, 0);
-    if (!orderId) return res.status(400).json({ ok: false, message: "Invalid orderId" });
+    if (!orderId) return res.status(400).json({ ok:false, message:"Invalid orderId" });
 
     const raw = await fetchSingleOrderFromExtensiv(orderId);
 
@@ -109,218 +98,137 @@ r.get("/order/:id", async (req, res) => {
     const cols = await getExistingCols(pool);
 
     const linesRaw = linesFromOrderPayload(raw);
-    const normLines = [];
+    const lines = [];
 
     for (const it of linesRaw) {
       const iro = it?.readOnly || it?.ReadOnly || {};
-      const sku =
-        it?.itemIdentifier?.sku ??
-        it?.ItemIdentifier?.Sku ??
-        it?.sku ??
-        it?.SKU ??
-        "";
       const line = {
-        OrderItemID: toInt(iro.orderItemId ?? iro.OrderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
+        OrderItemID: toInt(iro.orderItemId ?? iro.orderItemId ?? it.orderItemId ?? it.OrderItemId, 0),
         OrderID: orderHeader.orderId,
         CustomerID: orderHeader.customerId,
         CustomerName: orderHeader.customerName,
-        SKU: s(sku, 150),
-        Qualifier: s(it?.qualifier ?? it?.Qualifier ?? "", 80),
+        SKU: s(it?.itemIdentifier?.sku ?? it?.sku ?? it?.SKU ?? "", 150),
+        Qualifier: s(it?.qualifier ?? "", 80),
         OrderedQTY: toInt(it?.qty ?? it?.orderedQty ?? it?.Qty ?? 0, 0),
-        // unitIdentifier is usually on the readOnly block of the LINE
-        UnitID: toInt(iro?.unitIdentifier?.id ?? it?.unitIdentifier?.id, 0),
-        UnitName: s(iro?.unitIdentifier?.name ?? it?.unitIdentifier?.name ?? "", 80),
+        UnitID: toInt(iro?.unitIdentifier?.id, 0),
+        UnitName: s(iro?.unitIdentifier?.name, 80),
         ReferenceNum: orderHeader.referenceNum,
       };
       if (!line.OrderItemID) continue;
       await upsertOrderDetail(pool, cols, line);
-      normLines.push(line);
+      lines.push(line);
     }
 
-    // Inventory snapshot (for UI): by ItemID (=SKU) + Qualifier for these lines
-    let invRows = [];
-    if (normLines.length) {
-      const tvp = new sql.Table();
-      tvp.columns.add("ItemID", sql.VarChar(150));
-      tvp.columns.add("Qualifier", sql.VarChar(80));
-      const keySet = new Set();
-      normLines.forEach((ln) => {
-        const k = `${ln.SKU}||${ln.Qualifier}`;
-        if (!keySet.has(k)) {
-          keySet.add(k);
-          tvp.rows.add(ln.SKU, ln.Qualifier || "");
-        }
-      });
-      const reqInv = pool.request();
-      reqInv.input("Pairs", tvp);
-      invRows = (
-        await reqInv.query(`
-          SELECT i.*
-          FROM dbo.Inventory i
-          JOIN @Pairs p
-            ON i.ItemID = p.ItemID AND ISNULL(i.Qualifier,'') = ISNULL(p.Qualifier,'')
-          ORDER BY i.ItemID, i.LocationName
-        `)
-      ).recordset;
-    }
-
-    res.json({ ok: true, order: orderHeader, lines: normLines, inventory: invRows });
+    res.json({ ok: true, order: orderHeader, lines });
   } catch (e) {
-    res.status(500).json({ ok: false, message: e.message, data: e.response?.data });
+    res.status(500).json({ ok:false, message: e.message });
   }
 });
 
-/**
- * POST /api/single-alloc/allocate
- * body: { orderId: number, lineIds: number[] }
- * - Clears SuggAlloc for those lineIds
- * - Runs looped/CTE allocation (fixed version)
- */
+// POST /api/single-alloc/allocate
 r.post("/allocate", async (req, res) => {
   try {
     const { orderId, lineIds } = req.body || {};
-    const oid = toInt(orderId, 0);
-    if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
-    if (!Array.isArray(lineIds) || !lineIds.length)
-      return res.status(400).json({ ok: false, message: "lineIds required" });
+    if (!toInt(orderId)) return res.status(400).json({ ok:false, message:"orderId required" });
+    if (!Array.isArray(lineIds) || !lineIds.length) return res.status(400).json({ ok:false, message:"lineIds required" });
 
-    const ids = lineIds.map((n) => toInt(n, 0)).filter(Boolean);
-    if (!ids.length) return res.status(400).json({ ok: false, message: "No valid lineIds" });
-
+    const ids = lineIds.map(n => toInt(n)).filter(Boolean).join(",");
     const pool = await getPool();
 
-    // Temp table for ids (parameterized & safe)
-    const tvp = new sql.Table();
-    tvp.columns.add("OrderItemID", sql.Int);
-    ids.forEach((id) => tvp.rows.add(id));
+    await pool.request().batch(`
+      DELETE SuggAlloc WHERE OrderItemID IN (${ids});
 
-    const req = pool.request();
-    req.input("Ids", tvp);
-
-    await req.batch(`
-      -- Clear existing suggestions for these lines (optional but typical)
-      DELETE s
-      FROM dbo.SuggAlloc s
-      JOIN @Ids i ON s.OrderItemID = i.OrderItemID;
-
-      DECLARE @RemainingOpenQty INT = 1;
+      DECLARE @RemainingOpenQty INT;
+      SET @RemainingOpenQty = 1;
 
       WHILE @RemainingOpenQty > 0
       BEGIN
-        ;WITH base AS (
-          SELECT
-            od.OrderItemID,
-            od.OrderedQTY,
-            inv.ReceiveItemID,
-            inv.AvailableQTY,
-            inv.ReceivedQty,
-            inv.LocationName,
-            ISNULL(sa.SumQty, 0)                           AS SumSuggAllocQty,
-            od.OrderedQTY - ISNULL(sa.SumQty, 0)           AS RemainingOpenQty,
-            CASE
-              WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) = 'A'  AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) = inv.AvailableQTY THEN 1
-              WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) <> 'A' AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) = inv.AvailableQTY THEN 2
-              WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) <> 'A' AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) > inv.AvailableQTY THEN 3
-              WHEN inv.ReceivedQty = inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) = 'A'  AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) > inv.AvailableQTY THEN 4
-              WHEN inv.ReceivedQty >  inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) = 'A'  AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) >= inv.AvailableQTY THEN 5
-              WHEN inv.ReceivedQty >  inv.AvailableQty AND SUBSTRING(inv.LocationName,4,1) <> 'A' AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) >= inv.AvailableQTY THEN 6
-              WHEN SUBSTRING(inv.LocationName,4,1) = 'A'  AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) <= inv.AvailableQTY THEN 7
-              WHEN SUBSTRING(inv.LocationName,4,1) <> 'A' AND (od.OrderedQTY-ISNULL(sa.SumQty,0)) <= inv.AvailableQTY THEN 8
-            END AS Seq
-          FROM dbo.OrderDetails od
-          JOIN @Ids i ON od.OrderItemID = i.OrderItemID
-          INNER JOIN dbo.Inventory inv
-            ON od.ItemID = inv.ItemID AND ISNULL(od.Qualifier,'') = ISNULL(inv.Qualifier,'')
-          LEFT JOIN (
-            SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumQty
-            FROM dbo.SuggAlloc
-            GROUP BY OrderItemID
-          ) sa ON sa.OrderItemID = od.OrderItemID
-          WHERE inv.ReceiveItemID NOT IN (SELECT DISTINCT ReceiveItemID FROM dbo.SuggAlloc)
-            AND inv.AvailableQTY > 0
-        )
-        INSERT INTO dbo.SuggAlloc (OrderItemID, ReceiveItemID, SuggAllocQty)
+        INSERT INTO SuggAlloc (OrderItemID, ReceiveItemID, SuggAllocQty)
         SELECT TOP 1
-          b.OrderItemID,
-          b.ReceiveItemID,
-          CASE WHEN b.RemainingOpenQty >= b.AvailableQTY THEN b.AvailableQTY ELSE b.RemainingOpenQty END
-        FROM base b
-        WHERE b.RemainingOpenQty > 0
-        ORDER BY
-          b.OrderItemID,
-          b.Seq ASC,
-          CASE WHEN b.Seq IN (1,2,3,4,5,6) THEN b.AvailableQTY
-               ELSE 999999 - b.AvailableQTY
-          END DESC;
-
-        -- recompute remaining across selected lines
-        SELECT @RemainingOpenQty = MAX(remaining)
+          a.OrderItemID, b.ReceiveItemID,
+          CASE WHEN (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQTY
+               THEN b.AvailableQTY
+               ELSE (a.OrderedQTY - ISNULL(c.SumSuggAllocQty,0))
+          END AS AllocQty
         FROM (
           SELECT
-            od.OrderItemID,
-            od.OrderedQTY - ISNULL(sa.SumQty,0) AS remaining
-          FROM dbo.OrderDetails od
-          JOIN @Ids i ON od.OrderItemID = i.OrderItemID
-          LEFT JOIN (
-            SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS SumQty
-            FROM dbo.SuggAlloc
-            GROUP BY OrderItemID
-          ) sa ON sa.OrderItemID = od.OrderItemID
-        ) r;
+            a.OrderItemID, a.OrderedQTY, b.ReceiveItemID, b.AvailableQTY,
+            ISNULL(c.SumSuggAllocQty,0) AS SumSuggAllocQty,
+            a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0) AS RemainingOpenQty,
+            b.LocationName,
+            CASE
+              WHEN b.ReceivedQty=b.AvailableQty AND SUBSTRING(b.LocationName,4,1)='A'  AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) = b.AvailableQTY THEN 1
+              WHEN b.ReceivedQty=b.AvailableQty AND SUBSTRING(b.LocationName,4,1)<>'A' AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) = b.AvailableQTY THEN 2
+              WHEN b.ReceivedQty=b.AvailableQty AND SUBSTRING(b.LocationName,4,1)<>'A' AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) > b.AvailableQTY THEN 3
+              WHEN b.ReceivedQty=b.AvailableQty AND SUBSTRING(b.LocationName,4,1)='A'  AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) > b.AvailableQTY THEN 4
+              WHEN b.ReceivedQty>b.AvailableQty  AND SUBSTRING(b.LocationName,4,1)='A'  AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQTY THEN 5
+              WHEN b.ReceivedQty>b.AvailableQty  AND SUBSTRING(b.LocationName,4,1)<>'A' AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) >= b.AvailableQTY THEN 6
+              WHEN SUBSTRING(b.LocationName,4,1)='A'  AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) <= b.AvailableQTY THEN 7
+              WHEN SUBSTRING(b.LocationName,4,1)<>'A' AND (a.OrderedQTY-ISNULL(c.SumSuggAllocQty,0)) <= b.AvailableQTY THEN 8
+            END AS Seq
+          FROM dbo.OrderDetails a
+          LEFT JOIN dbo.Inventory b
+            ON a.ItemID = b.ItemID AND a.Qualifier = b.Qualifier
+          LEFT JOIN (SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) SumSuggAllocQty FROM SuggAlloc GROUP BY OrderItemID) c
+            ON a.OrderItemID = c.OrderItemID
+          WHERE a.OrderItemID IN (${ids})
+            AND b.ReceiveItemId NOT IN (SELECT DISTINCT ReceiveItemID FROM SuggAlloc)
+            AND b.AvailableQTY > 0
+        ) a
+        WHERE a.RemainingOpenQty > 0
+        ORDER BY a.OrderItemID, a.Seq ASC,
+                 CASE WHEN a.seq IN (1,2,3,4,5,6) THEN a.AvailableQty+0 WHEN a.seq IN (7,9) THEN 999999-a.AvailableQty END DESC;
 
-        IF @RemainingOpenQty IS NULL SET @RemainingOpenQty = 0;
+        SET @RemainingOpenQty = (
+          SELECT TOP 1 ISNULL(OrderedQty - SumSuggAllocQty, 0)
+          FROM (
+            SELECT od.OrderedQTY AS OrderedQty, sa.SumSuggAllocQty
+            FROM OrderDetails od
+            LEFT JOIN (SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) SumSuggAllocQty FROM SuggAlloc GROUP BY OrderItemID) sa
+              ON od.OrderItemID = sa.OrderItemID
+            WHERE od.OrderItemID IN (${ids})
+          ) t
+        );
       END
     `);
 
-    res.json({ ok: true, orderId: oid, linesAffected: ids.length });
+    res.json({ ok: true, orderId, linesAffected: lineIds.length });
   } catch (e) {
-    res.status(500).json({ ok: false, message: e.message });
+    res.status(500).json({ ok:false, message: e.message });
   }
 });
 
-/**
- * POST /api/single-alloc/push
- * body: { orderId }
- * - Reads SuggAlloc for the order's lines
- * - Sends to Extensiv /orders/{id}/allocator
- */
+// POST /api/single-alloc/push
 r.post("/push", async (req, res) => {
   try {
     const { orderId } = req.body || {};
-    const oid = toInt(orderId, 0);
-    if (!oid) return res.status(400).json({ ok: false, message: "orderId required" });
+    if (!toInt(orderId)) return res.status(400).json({ ok:false, message:"orderId required" });
 
     const pool = await getPool();
-    const rs = await pool.request().input("orderId", sql.Int, oid).query(`
-      SELECT sa.OrderItemID, sa.ReceiveItemID, sa.SuggAllocQty
-      FROM dbo.SuggAlloc sa
-      WHERE sa.OrderItemID IN (SELECT OrderItemID FROM dbo.OrderDetails WHERE OrderID = @orderId)
-        AND ISNULL(sa.SuggAllocQty,0) > 0
-      ORDER BY sa.OrderItemID, sa.ReceiveItemID
+    const allocs = await pool.request().query(`
+      SELECT OrderItemID, ReceiveItemID, SuggAllocQty
+      FROM SuggAlloc
+      WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID = ${toInt(orderId)})
+        AND ISNULL(SuggAllocQty,0) > 0
     `);
 
-    const allocations = rs.recordset.map((a) => ({
-      orderItemId: a.OrderItemID,
-      receiveItemId: a.ReceiveItemID,
-      qty: a.SuggAllocQty,
-    }));
+    const payload = {
+      allocations: allocs.recordset.map(a => ({
+        orderItemId: a.OrderItemID,
+        receiveItemId: a.ReceiveItemID,
+        qty: a.SuggAllocQty
+      }))
+    };
 
-    const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
-    );
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
     const headers = await authHeaders();
+    const resp = await axios.put(`${base}/orders/${orderId}/allocator`, payload, {
+      headers, timeout: 30000,
+    });
 
-    const resp = await axios.put(
-      `${base}/orders/${oid}/allocator`,
-      { allocations },
-      { headers, timeout: 30000 }
-    );
-
-    res.json({ ok: true, status: resp.status, sent: allocations.length });
+    res.json({ ok:true, status: resp.status, sent: payload.allocations.length });
   } catch (e) {
-    res
-      .status(500)
-      .json({ ok: false, message: e.message, data: e.response?.data || null });
+    res.status(500).json({ ok:false, message: e.message, data: e.response?.data });
   }
 });
 
