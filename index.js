@@ -84,6 +84,9 @@ const upload = multer({ storage });
 
 const users = [
   { username: "YS", password: "testCus1" },
+  { username: "nuvia", password: "admin1" },
+  { username: "salma", password: "admin2" },
+  { username: "Jorge", password: "Admin" },
   { username: "mw", password: "wmadmin" },
   { username: "sw", password: "wmadmin2" },
   { username: "crystal", password: "admin123" },
