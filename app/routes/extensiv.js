@@ -107,7 +107,7 @@ r.get("/token", async (_req, res, next) => {
 /* -------------------------------- PEEK --------------------------------- */
 r.get("/peek", async (_req, res, next) => {
   try {
-    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
     const h = await authHeadersSafe();
     const resp = await axios.get(`${base}/orders`, { headers: h, timeout: 15000 });
     const data = resp.data;
@@ -135,7 +135,7 @@ r.get("/peekOrder", async (req, res, next) => {
     }
 
     // fallback if helper not present
-    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
     const headers = await authHeadersSafe();
     const { data } = await axios.get(`${base}/orders`, {
       headers,
@@ -173,7 +173,7 @@ r.get("/selftest", async (_req, res) => {
     const headers = await authHeadersSafe();
     out.steps.auth = "ok";
 
-    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
     const o = await axios.get(`${base}/orders`, { headers, timeout: 15000 });
     const list = firstArray(o.data);
     out.steps.orders = { status: o.status, count: list.length };
