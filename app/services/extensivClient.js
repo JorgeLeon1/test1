@@ -112,7 +112,7 @@ async function listOrdersPage({ base, headers, pgsiz = 100, pgnum = 1, openOnly 
 
 export async function fetchOneOrderDetail(orderId) {
   const base = trimBase(
-    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com"
   );
   const headers = await authHeaders();
 
@@ -192,7 +192,7 @@ export async function fetchAndUpsertOrders({ maxPages = 10, pageSize = 200, open
   const existingCols = await getExistingOrderDetailsColumns(pool);
 
   const base = trimBase(
-    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com"
   );
   const headers = await authHeaders();
 
