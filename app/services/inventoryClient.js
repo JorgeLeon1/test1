@@ -20,7 +20,7 @@ const listify = (data) => {
 // ✅ Named export required by app/routes/extensiv.js
 export async function importInventory() {
   const base =
-    trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com");
+    trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
   const headers = await authHeaders();
   const pool = await getPool();
 
