@@ -108,7 +108,7 @@ r.post("/push", async (req, res, next) => {
     }));
 
     const headers = await ext.authHeaders();
-    const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com").replace(/\/+$/, "");
+    const base = (process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com").replace(/\/+$/, "");
 
     // PUT /orders/{orderId}/allocator
     const payload = { orderItems };
