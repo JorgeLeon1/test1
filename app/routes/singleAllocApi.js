@@ -13,7 +13,7 @@ const s = (v, max = 255) => (v == null ? "" : String(v).normalize("NFC").slice(0
 
 async function fetchSingleOrderFromExtensiv(orderId) {
   const base = trimBase(
-    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://box.secure-wms.com"
+    process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com"
   );
   const headers = await authHeaders();
 
