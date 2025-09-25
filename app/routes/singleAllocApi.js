@@ -78,68 +78,161 @@ ELSE
   await req.query(sqlText);
 }
 
-/* ======================= SINGLE-ORDER ENDPOINTS ======================= */
-
-/** GET /order/:id
- *  Lightweight "header" and lines for a single order (from OrderDetails).
- *  Use when mounted at /api/single-alloc → /api/single-alloc/order/:id
- */
+/* ----------------------- GET /order/:id (DB → Extensiv fallback) ----------------------- */
 r.get("/order/:id", async (req, res) => {
   try {
     const id = toInt(req.params.id, 0);
-    if (!id) return res.status(400).json({ ok: false, message: "Invalid order id" });
+    if (!id) return res.status(400).json({ ok:false, message:"Invalid order id" });
 
     const pool = await getPool();
 
-    const hdr = await pool
-      .request()
+    // 1) Try local DB first
+    const hdr = await pool.request()
       .input("id", sql.Int, id)
       .query(`
         SELECT TOP (1)
-          OrderID         AS orderId,
-          CustomerName    AS customerName,
-          ReferenceNum    AS referenceNum
+          OrderID      AS orderId,
+          CustomerName AS customerName,
+          ReferenceNum AS referenceNum
         FROM dbo.OrderDetails WITH (NOLOCK)
         WHERE OrderID = @id
         ORDER BY OrderItemID;
       `);
 
     if (!hdr.recordset.length) {
-      return res.status(404).json({ ok: false, message: "Order not found" });
+      // 2) Fallback: fetch from Extensiv, upsert into OrderDetails, then re-query
+      const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
+      const headers = await authHeaders();
+
+      const { status, data } = await axios.get(`${base}/orders/${id}`, {
+        headers,
+        params: { detail: "OrderItems", itemdetail: "All" },
+        timeout: 30000,
+        validateStatus: () => true,
+      });
+
+      if (!(status >= 200 && status < 300) || !data) {
+        return res.status(404).json({
+          ok:false,
+          message:"Order not found",
+          diagnostics:{ source:"extensiv", status }
+        });
+      }
+
+      // Normalize and upsert lines into OrderDetails
+      const ord = data;
+      const R   = ro(ord);
+      const orderId      = toInt(R.orderId ?? ord.orderId ?? R.OrderId ?? ord.OrderId, 0);
+      const customerId   = toInt(ord?.customerIdentifier?.id, 0);
+      const customerName = s(ord?.customerIdentifier?.name, 200);
+      const referenceNum = s(ord?.referenceNum, 120);
+
+      const cols  = await getExistingCols(pool);
+      const items = itemsFromOrder(ord) || [];
+
+      for (const it of items) {
+        const IR = ro(it);
+        const orderItemId = toInt(IR.orderItemId ?? it.orderItemId ?? IR.OrderItemId ?? it.OrderItemId, 0);
+        if (!orderItemId) continue;
+
+        const itemIdRaw = (it?.itemIdentifier?.id ?? it?.ItemID ?? "").toString();
+        const sku       = s(it?.itemIdentifier?.sku ?? it?.sku ?? it?.SKU ?? "", 150);
+        const unitId    = toInt(IR?.unitIdentifier?.id, 0);
+        const unitName  = s(IR?.unitIdentifier?.name ?? "", 80);
+        const qualifier = s(it?.qualifier ?? "", 80);
+        const qty       = toInt(
+          it?.qty ?? it?.orderedQty ?? it?.Qty ?? it?.OrderedQty ??
+          it?.quantity ?? it?.Quantity ?? it?.readOnly?.qty ??
+          it?.readOnly?.orderedQty ?? it?.readOnly?.quantity ?? 0, 0
+        );
+
+        await upsertOrderDetail(pool, cols, {
+          OrderItemID: orderItemId,
+          OrderID: orderId,
+          CustomerID: customerId,
+          CustomerName: customerName,
+          SKU: sku,
+          ItemID: itemIdRaw,
+          Qualifier: qualifier,
+          OrderedQTY: qty,
+          UnitID: unitId,
+          UnitName: unitName,
+          ReferenceNum: referenceNum,
+        });
+      }
+
+      // Re-query DB after ingest
+      const hdr2 = await pool.request()
+        .input("id", sql.Int, id)
+        .query(`
+          SELECT TOP (1)
+            OrderID      AS orderId,
+            CustomerName AS customerName,
+            ReferenceNum AS referenceNum
+          FROM dbo.OrderDetails WITH (NOLOCK)
+          WHERE OrderID = @id
+          ORDER BY OrderItemID;
+        `);
+
+      if (!hdr2.recordset.length) {
+        return res.status(404).json({
+          ok:false,
+          message:"Order not found after ingest",
+          diagnostics:{ source:"db", orderId:id }
+        });
+      }
+
+      const linesQ2 = await pool.request()
+        .input("id", sql.Int, id)
+        .query(`
+          SELECT OrderItemID, OrderID, SKU, OrderedQTY,
+                 ISNULL(Qualifier,'') AS Qualifier,
+                 ISNULL(UnitName,'')  AS UnitName
+          FROM dbo.OrderDetails WITH (NOLOCK)
+          WHERE OrderID = @id
+          ORDER BY OrderItemID;
+        `);
+
+      const order2 = hdr2.recordset[0];
+      const lines2 = linesQ2.recordset.map(x => ({
+        OrderItemID: x.OrderItemID,
+        orderItemId: x.OrderItemID,
+        sku: x.SKU,
+        OrderedQTY: x.OrderedQTY,
+        Qualifier: x.Qualifier,
+        unitName: x.UnitName,
+      }));
+
+      return res.json({ ok:true, order: order2, lines: lines2, source: "extensiv→db" });
     }
 
-    const linesQ = await pool
-      .request()
+    // 3) DB had it — return immediately
+    const linesQ = await pool.request()
       .input("id", sql.Int, id)
       .query(`
-        SELECT
-          OrderItemID,
-          OrderID,
-          SKU,
-          OrderedQTY,
-          ISNULL(Qualifier,'') AS Qualifier,
-          ISNULL(UnitName,'')  AS UnitName
+        SELECT OrderItemID, OrderID, SKU, OrderedQTY,
+               ISNULL(Qualifier,'') AS Qualifier,
+               ISNULL(UnitName,'')  AS UnitName
         FROM dbo.OrderDetails WITH (NOLOCK)
         WHERE OrderID = @id
         ORDER BY OrderItemID;
       `);
 
     const order = hdr.recordset[0];
-    const lines = linesQ.recordset.map((x) => ({
+    const lines = linesQ.recordset.map(x => ({
       OrderItemID: x.OrderItemID,
-      orderItemId: x.OrderItemID, // camelCase for UI
+      orderItemId: x.OrderItemID,
       sku: x.SKU,
       OrderedQTY: x.OrderedQTY,
       Qualifier: x.Qualifier,
       unitName: x.UnitName,
     }));
 
-    return res.json({ ok: true, order, lines });
+    return res.json({ ok:true, order, lines, source: "db" });
   } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
+    return res.status(500).json({ ok:false, message:e.message });
   }
 });
-
 /* ======================= BATCH: SEARCH/INGEST ENDPOINTS ======================= */
 
 /* ----------------------- GET /search ----------------------- */
