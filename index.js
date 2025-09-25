@@ -89,6 +89,7 @@ const users = [
   { username: "Jorge", password: "Admin" },
   { username: "mw", password: "wmadmin" },
   { username: "sw", password: "wmadmin2" },
+  { username: "selina", password: "wmadmin3" },
   { username: "crystal", password: "admin123" },
 ];
 
