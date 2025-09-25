@@ -77,6 +77,60 @@ ELSE
 `;
   await req.query(sqlText);
 }
+// Add this BELOW your helpers, ABOVE other routes
+r.get("/order/:id/allocations", async (req, res) => {
+  try {
+    const orderId = Number.parseInt(req.params.id, 10) || 0;
+    if (!orderId) return res.status(400).json({ ok:false, message:"Invalid order id" });
+
+    const pool = await getPool();
+
+    // Per-line SuggAlloc joined to OrderDetails for SKU/qty context
+    const lines = await pool.request()
+      .input("oid", sql.Int, orderId)
+      .query(`
+        SELECT 
+          od.OrderID,
+          od.OrderItemID,
+          od.SKU,
+          od.OrderedQTY,
+          ISNULL(od.Qualifier,'') AS Qualifier,
+          ISNULL(sa.Alloc,0)      AS Allocated,
+          (od.OrderedQTY - ISNULL(sa.Alloc,0)) AS Remaining
+        FROM OrderDetails od
+        LEFT JOIN (
+          SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS Alloc
+          FROM SuggAlloc GROUP BY OrderItemID
+        ) sa ON sa.OrderItemID = od.OrderItemID
+        WHERE od.OrderID = @oid
+        ORDER BY od.OrderItemID
+      `);
+
+    const totals = await pool.request()
+      .input("oid", sql.Int, orderId)
+      .query(`
+        SELECT 
+          SUM(od.OrderedQTY)                       AS totalOrdered,
+          SUM(ISNULL(sa.Alloc,0))                  AS totalAllocated,
+          SUM(od.OrderedQTY - ISNULL(sa.Alloc,0))  AS totalRemaining
+        FROM OrderDetails od
+        LEFT JOIN (
+          SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS Alloc
+          FROM SuggAlloc GROUP BY OrderItemID
+        ) sa ON sa.OrderItemID = od.OrderItemID
+        WHERE od.OrderID = @oid
+      `);
+
+    return res.json({
+      ok: true,
+      orderId,
+      totals: totals.recordset[0] || { totalOrdered: 0, totalAllocated: 0, totalRemaining: 0 },
+      lines: lines.recordset,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok:false, message: e.message });
+  }
+});
 
 /* ----------------------- GET /order/:id (DB → Extensiv fallback) ----------------------- */
 r.get("/order/:id", async (req, res) => {
@@ -562,41 +616,35 @@ r.post("/search-by-ids", async (req, res) => {
   }
 });
 
-/* ======================= ALLOCATE / PUSH (SINGLE OR BATCH) ======================= */
-/** POST /allocate
- *  Accepts either:
- *   - { orderIds: number[] }  → batch
- *   - { orderId:  number   }  → single
- *  Work based on OrderDetails + SuggAlloc tables.
- */
 r.post("/allocate", async (req, res) => {
   try {
     let ids = Array.isArray(req.body?.orderIds)
-      ? req.body.orderIds.map((n) => toInt(n)).filter(Boolean)
+      ? req.body.orderIds.map(n => (Number.isFinite(Number(n)) ? Math.trunc(Number(n)) : 0)).filter(Boolean)
       : [];
-    const singleId = toInt(req.body?.orderId, 0);
+    const singleId = Number.isFinite(Number(req.body?.orderId)) ? Math.trunc(Number(req.body.orderId)) : 0;
     if (!ids.length && singleId) ids = [singleId];
 
-    if (!ids.length) {
-      return res.status(400).json({ ok: false, message: "orderIds or orderId required" });
-    }
+    if (!ids.length) return res.status(400).json({ ok:false, message:"orderIds or orderId required" });
 
     const pool = await getPool();
+    const results = [];
 
-    // Gather target line IDs
-    const idQuery = await pool.request().query(`
-      SELECT OrderItemID
-      FROM OrderDetails
-      WHERE OrderID IN (${ids.join(",")})
-    `);
-    const lineIds = idQuery.recordset.map((r0) => r0.OrderItemID);
-    if (!lineIds.length) return res.json({ ok: true, allocated: 0, summary: [] });
+    for (const orderId of ids) {
+      // collect target line IDs
+      const idQuery = await pool.request()
+        .input("oid", sql.Int, orderId)
+        .query(`SELECT OrderItemID FROM OrderDetails WHERE OrderID=@oid;`);
+      const lineIds = idQuery.recordset.map(r => r.OrderItemID);
 
-    // Clear allocations for these lines
-    await pool.request().query(`DELETE SuggAlloc WHERE OrderItemID IN (${lineIds.join(",")});`);
+      if (!lineIds.length) {
+        results.push({ orderId, ok:false, reason:"No lines in OrderDetails" });
+        continue;
+      }
 
-    // Allocation loop (ItemID string equality → SKU fallback), qualifier normalized
-    await pool.request().batch(`
+      await pool.request().query(`DELETE SuggAlloc WHERE OrderItemID IN (${lineIds.join(",")});`);
+
+      // allocation loop (unchanged)
+      await pool.request().batch(`
 DECLARE @iters INT = 0;
 DECLARE @maxIters INT = 20000;
 
@@ -624,8 +672,6 @@ BEGIN
       UPPER(LTRIM(RTRIM(CAST(inv.ItemID AS VARCHAR(128))))) AS ItemIDStr,
       UPPER(LTRIM(RTRIM(inv.SKU)))                          AS SKU_N,
       NULLIF(UPPER(LTRIM(RTRIM(inv.Qualifier))),'')         AS Qual_N,
-      inv.LocationName,
-      inv.ReceivedQty,
       inv.AvailableQTY
     FROM Inventory inv
   ),
@@ -655,13 +701,7 @@ BEGIN
       AND NOT EXISTS (SELECT 1 FROM cand_t1 t WHERE t.OrderItemID = x.OrderItemID)
       AND NOT EXISTS (SELECT 1 FROM cand_t2 t WHERE t.OrderItemID = x.OrderItemID)
   ),
-  cand AS (
-    SELECT * FROM cand_t1
-    UNION ALL
-    SELECT * FROM cand_t2
-    UNION ALL
-    SELECT * FROM cand_t3
-  ),
+  cand AS (SELECT * FROM cand_t1 UNION ALL SELECT * FROM cand_t2 UNION ALL SELECT * FROM cand_t3),
   pick AS (
     SELECT TOP (1)
       c.OrderItemID,
@@ -690,162 +730,158 @@ BEGIN
   )
     BREAK;
 END;
-    `);
+      `);
 
-    const summary = await pool.request().query(`
-      SELECT od.OrderID, od.OrderItemID, od.SKU, od.OrderedQTY,
-             ISNULL(x.Alloc,0) AS Allocated,
-             (od.OrderedQTY - ISNULL(x.Alloc,0)) AS Remaining
-      FROM OrderDetails od
-      LEFT JOIN (
-        SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS Alloc
-        FROM SuggAlloc GROUP BY OrderItemID
-      ) x ON x.OrderItemID = od.OrderItemID
-      WHERE od.OrderItemID IN (${lineIds.join(",")})
-      ORDER BY od.OrderID, od.OrderItemID;
-    `);
+      // line-level summary + totals
+      const summary = await pool.request()
+        .input("oid", sql.Int, orderId)
+        .query(`
+          SELECT od.OrderItemID, od.SKU, od.OrderedQTY,
+                 ISNULL(x.Alloc,0) AS Allocated,
+                 (od.OrderedQTY - ISNULL(x.Alloc,0)) AS Remaining
+          FROM OrderDetails od
+          LEFT JOIN (
+            SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS Alloc
+            FROM SuggAlloc GROUP BY OrderItemID
+          ) x ON x.OrderItemID = od.OrderItemID
+          WHERE od.OrderID = @oid
+          ORDER BY od.OrderItemID;
+        `);
 
-    return res.json({ ok: true, allocated: summary.recordset.length, summary: summary.recordset });
+      const totals = await pool.request()
+        .input("oid", sql.Int, orderId)
+        .query(`
+          SELECT 
+            SUM(od.OrderedQTY)                       AS totalOrdered,
+            SUM(ISNULL(x.Alloc,0))                   AS totalAllocated,
+            SUM(od.OrderedQTY - ISNULL(x.Alloc,0))   AS totalRemaining
+          FROM OrderDetails od
+          LEFT JOIN (
+            SELECT OrderItemID, SUM(ISNULL(SuggAllocQty,0)) AS Alloc
+            FROM SuggAlloc GROUP BY OrderItemID
+          ) x ON x.OrderItemID = od.OrderItemID
+          WHERE od.OrderID = @oid;
+        `);
+
+      results.push({
+        orderId,
+        ok: true,
+        totals: totals.recordset[0] || { totalOrdered: 0, totalAllocated: 0, totalRemaining: 0 },
+        lines: summary.recordset,
+      });
+    }
+
+    return res.json({ ok:true, results });
   } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message });
+    return res.status(500).json({ ok:false, message:e.message });
   }
 });
 
-/** POST /push
- *  Accepts either:
- *   - { orderIds: number[], forceMethod?: "auto"|"put"|"post" }
- *   - { orderId:  number,   forceMethod?: "auto"|"put"|"post" }
- */
 r.post("/push", async (req, res) => {
   try {
     let ids = Array.isArray(req.body?.orderIds)
-      ? req.body.orderIds.map((n) => toInt(n)).filter(Boolean)
+      ? req.body.orderIds.map(n => (Number.isFinite(Number(n)) ? Math.trunc(Number(n)) : 0)).filter(Boolean)
       : [];
-    const singleId = toInt(req.body?.orderId, 0);
+    const singleId = Number.isFinite(Number(req.body?.orderId)) ? Math.trunc(Number(req.body.orderId)) : 0;
     if (!ids.length && singleId) ids = [singleId];
 
-    if (!ids.length) {
-      return res.status(400).json({ ok: false, message: "orderIds or orderId required" });
-    }
+    if (!ids.length) return res.status(400).json({ ok:false, message:"orderIds or orderId required" });
 
-    const forceMethod = String(req.body?.forceMethod || "auto").toLowerCase();
-    const isValidMethod = (m) => m === "auto" || m === "put" || m === "post";
-
-    const base = trimBase(
-      process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com"
-    );
+    const base = trimBase(process.env.EXT_API_BASE || process.env.EXT_BASE_URL || "https://secure-wms.com");
     const headers = await authHeaders();
-    headers["Content-Type"] = headers["Content-Type"] || "application/json";
     headers["Accept"] = headers["Accept"] || "application/json";
+    headers["Content-Type"] = headers["Content-Type"] || "application/json";
 
+    const fm = String(req.body?.forceMethod || "auto").toLowerCase();
     const pool = await getPool();
     const results = [];
 
+    const send = async (oid, method, payload) => {
+      const resp = await axios({
+        url: `${base}/orders/${oid}/allocator`,
+        method,
+        headers,
+        data: payload,
+        timeout: 30000,
+        validateStatus: () => true,
+      });
+      const body = resp.data;
+      let excerpt = "";
+      if (typeof body === "string") excerpt = body.slice(0, 300);
+      else if (body && typeof body === "object") {
+        const keys = Object.keys(body);
+        excerpt = JSON.stringify(
+          { keys: keys.slice(0, 8), errors: body.errors?.length || 0, warnings: body.warnings?.length || 0 },
+          null,
+          0
+        ).slice(0, 300);
+      }
+      return { status: resp.status, excerpt };
+    };
+
     for (const oid of ids) {
-      const allocs = await pool
-        .request()
-        .input("OrderID", sql.Int, oid)
+      const allocs = await pool.request()
+        .input("oid", sql.Int, oid)
         .query(`
           SELECT OrderItemID, ReceiveItemID, SuggAllocQty
           FROM SuggAlloc
-          WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@OrderID)
+          WHERE OrderItemID IN (SELECT OrderItemID FROM OrderDetails WHERE OrderID=@oid)
             AND ISNULL(SuggAllocQty,0) > 0
         `);
 
       const payload = {
-        allocations: allocs.recordset.map((a) => ({
+        allocations: allocs.recordset.map(a => ({
           orderItemId: a.OrderItemID,
           receiveItemId: a.ReceiveItemID,
-          qty: a.SuggAllocQty,
+          qty: a.SuggAllocQty
         })),
       };
 
-      if (payload.allocations.length === 0) {
-        results.push({
-          orderId: oid,
-          ok: false,
-          status: 204,
-          reason: "No allocations to push (SuggAlloc empty)",
-          sentAllocations: 0,
-        });
+      if (!payload.allocations.length) {
+        results.push({ orderId: oid, ok:false, status:204, noOp:true, reason:"No allocations in SuggAlloc" });
         continue;
       }
 
-      const sendAllocator = async (method) => {
-        const url = `${base}/orders/${oid}/allocator`;
-        const resp = await axios({
-          url,
-          method,
-          headers,
-          data: payload,
-          timeout: 30000,
-          validateStatus: () => true,
-        });
-        let body = resp.data;
-        let summary = "";
-        if (body && typeof body === "object") {
-          const keys = Object.keys(body).slice(0, 6).join(", ");
-          summary = `keys: ${keys}`;
-          if (Array.isArray(body.errors) && body.errors.length) {
-            summary += `; errors: ${body.errors.length}`;
-          }
-          if (Array.isArray(body.warnings) && body.warnings.length) {
-            summary += `; warnings: ${body.warnings.length}`;
-          }
-        } else if (typeof body === "string") {
-          summary = body.slice(0, 140);
-        }
-        return { status: resp.status, summary };
-      };
-
       let attempt;
-      if (isValidMethod(forceMethod) && forceMethod !== "auto") {
-        attempt = await sendAllocator(forceMethod);
+      if (fm === "put" || fm === "post") {
+        attempt = await send(oid, fm, payload);
       } else {
-        attempt = await sendAllocator("put");
-        if ([404, 405, 501].includes(attempt.status)) {
-          const fallback = await sendAllocator("post");
-          if (fallback.status >= 200 && fallback.status < 300) {
-            attempt = { ...fallback, triedFallback: true, primaryStatus: attempt.status };
+        attempt = await send(oid, "put", payload);
+        if ([404,405,501].includes(attempt.status)) {
+          const fb = await send(oid, "post", payload);
+          if (fb.status >= 200 && fb.status < 300) {
+            attempt = { ...fb, triedFallback:true, primaryStatus: attempt.status };
           } else {
-            attempt = { ...attempt, fallbackStatus: fallback.status, fallbackSummary: fallback.summary };
+            attempt = { ...attempt, fallbackStatus: fb.status, fallbackExcerpt: fb.excerpt };
           }
         }
       }
 
       const ok = attempt.status >= 200 && attempt.status < 300;
-      const noOp =
-        ok &&
-        (attempt.status === 204 ||
-          attempt.summary === "" ||
-          /no\s+change|no\s+alloc/i.test(attempt.summary || ""));
+      const noOp = ok && (
+        attempt.status === 204 ||
+        /no\s*change/i.test(attempt.excerpt || "") ||
+        /no\s*alloc/i.test(attempt.excerpt || "")
+      );
 
       results.push({
         orderId: oid,
         ok: ok && !noOp,
         status: attempt.status,
-        triedFallback: attempt.triedFallback || false,
+        noOp,
+        triedFallback: !!attempt.triedFallback,
         primaryStatus: attempt.primaryStatus,
-        forcedMethod: forceMethod !== "auto" ? forceMethod : undefined,
+        excerpt: attempt.excerpt, // short peek at Extensiv's response
         sentAllocations: payload.allocations.length,
-        responseSummary: attempt.summary,
       });
     }
 
-    const anyReal = results.some((r0) => r0.ok === true);
-    const hint = anyReal
-      ? null
-      : "No effective changes detected. Check SuggAlloc rows and endpoint method (PUT vs POST) for your tenant.";
-
-    res.json({ ok: true, results, hint });
+    return res.json({ ok:true, results });
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      message: e.message,
-      data: e.response?.data || null,
-    });
+    return res.status(500).json({ ok:false, message:e.message, data:e.response?.data || null });
   }
 });
+
 
 /* ======================= INVENTORY HELPERS ======================= */
 
