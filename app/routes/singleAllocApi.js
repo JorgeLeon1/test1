@@ -282,9 +282,12 @@ BEGIN
       c.AvailableQTY
     FROM cand c
     ORDER BY c.OrderItemID, c.Seq ASC,
-      CASE WHEN c.Seq IN (1,2,3,4,5,6) THEN c.AvailableQTY+0
-           WHEN c.Seq IN (7,9)        THEN 999999-c.AvailableQTY
-      END DESC
+  CASE 
+    WHEN c.Seq IN (1,2,3,4,6) THEN c.AvailableQTY
+    WHEN c.Seq IN (5,7,8)     THEN 1000000 - c.AvailableQTY
+  END DESC,
+  c.ReceiveItemID ASC
+
   )
   INSERT INTO SuggAlloc (OrderItemID, ReceiveItemID, SuggAllocQty)
   SELECT OrderItemID, ReceiveItemID, AllocQty
